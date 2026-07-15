@@ -30,116 +30,95 @@ internal sealed record AnalysisResult(
     long ExtractedBytes,
     int ExtractedFiles);
 
+/// <summary>
+/// Backwards-compatible facade retained for the v2 UI and existing integrations.
+/// The v3 UI should call <see cref="WorkflowCoordinator"/> directly.
+/// </summary>
 internal static class AnalysisPipeline
 {
-    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    internal static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    public static async Task<AnalysisResult> ExtractAndAnalyzeAsync(
+    public static Task<AnalysisResult> ExtractAndAnalyzeAsync(
         string packageName,
         string source,
         string jobRoot,
         IProgress<string>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        var originalDir = Path.Combine(jobRoot, "Original_APKs");
-        var inputDir = Path.Combine(jobRoot, "AssetRipper_Input");
-        var keyDir = Path.Combine(jobRoot, "KeyFiles");
-        var apks = Directory.Exists(originalDir)
-            ? Directory.EnumerateFiles(originalDir, "*.apk", SearchOption.AllDirectories).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList()
-            : [];
-        if (apks.Count == 0) throw new InvalidOperationException("下载目录中没有找到 APK 文件。\r\n");
-
-        progress?.Report("校验 APK 与磁盘空间");
-        long expandedBytes = 0;
-        foreach (var apk in apks)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            try
-            {
-                using var archive = ZipFile.OpenRead(apk);
-                expandedBytes = checked(expandedBytes + archive.Entries.Sum(x => x.Length));
-            }
-            catch (InvalidDataException ex)
-            {
-                throw new InvalidDataException($"APK 损坏或不是有效 ZIP：{Path.GetFileName(apk)}", ex);
-            }
-        }
-        var drive = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(jobRoot))!);
-        var required = expandedBytes + 256L * 1024 * 1024;
-        if (drive.AvailableFreeSpace < required)
-            throw new IOException($"磁盘空间不足。预计至少需要 {FormatBytes(required)}，当前可用 {FormatBytes(drive.AvailableFreeSpace)}。\r\n");
-
-        Directory.CreateDirectory(inputDir);
-        Directory.CreateDirectory(keyDir);
-        var splitInfos = new List<SplitInfo>();
-        long extractedBytes = 0;
-        var extractedFiles = 0;
-        var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var apk in apks)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var splitName = MakeUniqueName(NormalizeSplitName(packageName, Path.GetFileName(apk)), usedNames);
-            var splitDir = Path.Combine(inputDir, splitName);
-            Directory.CreateDirectory(splitDir);
-            progress?.Report($"解压 {Path.GetFileName(apk)}");
-            var stats = await ExtractApkSafelyAsync(apk, splitDir, cancellationToken);
-            extractedBytes += stats.Bytes;
-            extractedFiles += stats.Files;
-            splitInfos.Add(new SplitInfo(Path.GetFileName(apk), ClassifySplit(packageName, Path.GetFileName(apk)), new FileInfo(apk).Length));
-        }
-
-        progress?.Report("识别游戏引擎和关键文件");
-        var files = Directory.EnumerateFiles(inputDir, "*", SearchOption.AllDirectories).ToList();
-        var relativeFiles = files.Select(x => Path.GetRelativePath(inputDir, x).Replace('\\', '/')).ToList();
-        var engine = DetectEngine(relativeFiles);
-        var backend = DetectScriptingBackend(relativeFiles);
-        var keyFiles = FindKeyFiles(relativeFiles);
-        var extensionCounts = relativeFiles
-            .GroupBy(x => string.IsNullOrEmpty(Path.GetExtension(x)) ? "(无扩展名)" : Path.GetExtension(x).ToLowerInvariant())
-            .OrderByDescending(x => x.Count())
-            .Take(100)
-            .ToDictionary(x => x.Key, x => x.Count(), StringComparer.OrdinalIgnoreCase);
-
-        progress?.Report("生成分析报告");
-        await WriteKeyIndexesAsync(keyDir, keyFiles, cancellationToken);
-        var reportPath = Path.Combine(jobRoot, "分析说明.txt");
-        var jsonPath = Path.Combine(jobRoot, "analysis.json");
-        var result = new AnalysisResult(packageName, source, jobRoot, originalDir, inputDir, reportPath, jsonPath,
-            engine, backend, splitInfos, keyFiles, extensionCounts, extractedBytes, extractedFiles);
-        await File.WriteAllTextAsync(reportPath, BuildChineseReport(result), new UTF8Encoding(false), cancellationToken);
-        await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(result, JsonOptions), new UTF8Encoding(false), cancellationToken);
-        return result;
+        IProgress<WorkflowProgress>? workflowProgress = progress == null
+            ? null
+            : new Progress<WorkflowProgress>(value => progress.Report(value.Message));
+        var coordinator = new WorkflowCoordinator();
+        return coordinator.ContinueDownloadedTaskInPlaceAsync(
+            packageName,
+            source,
+            jobRoot,
+            workflowProgress,
+            cancellationToken);
     }
 
-    internal static async Task<(long Bytes, int Files)> ExtractApkSafelyAsync(string apkPath, string destination, CancellationToken cancellationToken = default)
+    internal static async Task<(long Bytes, int Files)> ExtractApkSafelyAsync(
+        string apkPath,
+        string destination,
+        CancellationToken cancellationToken = default)
+        => await ExtractApkSafelyAsync(apkPath, destination, null, cancellationToken);
+
+    internal static async Task<(long Bytes, int Files)> ExtractApkSafelyAsync(
+        string apkPath,
+        string destination,
+        Action<long, int>? entryProgress,
+        CancellationToken cancellationToken = default)
     {
-        var root = Path.GetFullPath(destination).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        long bytes = 0;
-        var files = 0;
+        var destinationFull = Path.GetFullPath(destination).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var rootPrefix = destinationFull + Path.DirectorySeparatorChar;
         using var archive = ZipFile.OpenRead(apkPath);
+
+        // Validate every path before writing the first byte so a malicious late entry cannot
+        // leave a partially extracted archive behind.
         foreach (var entry in archive.Entries)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            _ = ResolveSafeArchiveTarget(entry, destinationFull, rootPrefix);
+        }
+
+        Directory.CreateDirectory(destinationFull);
+        long bytes = 0;
+        var files = 0;
+        foreach (var entry in archive.Entries)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var target = ResolveSafeArchiveTarget(entry, destinationFull, rootPrefix);
             var normalized = entry.FullName.Replace('\\', '/');
-            if (normalized.StartsWith('/') || normalized.Contains(':'))
-                throw new InvalidDataException($"APK 包含不安全路径：{entry.FullName}");
-            var target = Path.GetFullPath(Path.Combine(destination, normalized.Replace('/', Path.DirectorySeparatorChar)));
-            if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException($"APK 包含路径穿越条目：{entry.FullName}");
             if (normalized.EndsWith('/'))
             {
                 Directory.CreateDirectory(target);
                 continue;
             }
+
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
             await using var source = entry.Open();
-            await using var output = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, true);
-            await source.CopyToAsync(output, cancellationToken);
-            bytes += entry.Length;
+            await using var output = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None,
+                128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            await source.CopyToAsync(output, 128 * 1024, cancellationToken);
+            bytes = checked(bytes + entry.Length);
             files++;
+            entryProgress?.Invoke(bytes, files);
         }
         return (bytes, files);
+    }
+
+    private static string ResolveSafeArchiveTarget(ZipArchiveEntry entry, string destinationFull, string rootPrefix)
+    {
+        var normalized = entry.FullName.Replace('\\', '/');
+        if (string.IsNullOrWhiteSpace(normalized) || normalized.StartsWith('/') || normalized.Contains(':') || Path.IsPathRooted(normalized))
+            throw new InvalidDataException($"APK 包含不安全路径：{entry.FullName}");
+
+        var target = Path.GetFullPath(Path.Combine(destinationFull, normalized.Replace('/', Path.DirectorySeparatorChar)));
+        var directoryEntry = normalized.EndsWith('/');
+        var isRootDirectoryEntry = directoryEntry && target.Equals(destinationFull, StringComparison.OrdinalIgnoreCase);
+        if (!isRootDirectoryEntry && !target.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"APK 包含路径穿越条目：{entry.FullName}");
+        return target;
     }
 
     internal static GameEngine DetectEngine(IEnumerable<string> paths)
@@ -165,7 +144,7 @@ internal static class AnalysisPipeline
         return GameEngine.Unreal;
     }
 
-    private static string DetectScriptingBackend(IEnumerable<string> paths)
+    internal static string DetectScriptingBackend(IEnumerable<string> paths)
     {
         var list = paths.Select(x => x.Replace('\\', '/').ToLowerInvariant()).ToList();
         if (list.Any(x => x.EndsWith("libil2cpp.so"))) return "IL2CPP";
@@ -173,16 +152,38 @@ internal static class AnalysisPipeline
         return "未知/不适用";
     }
 
-    private static List<string> FindKeyFiles(IEnumerable<string> paths)
+    internal static List<string> FindKeyFiles(IEnumerable<string> paths)
     {
         return paths.Where(raw =>
         {
-            var path = raw.ToLowerInvariant();
+            var path = raw.Replace('\\', '/').ToLowerInvariant();
             var name = Path.GetFileName(path);
-            return name is "libil2cpp.so" or "global-metadata.dat" or "libunity.so" or "libue4.so" or "libunreal.so" or "globalgamemanagers" or "main.pck"
+            return name is "libil2cpp.so" or "global-metadata.dat" or "libunity.so" or "libue4.so" or "libunreal.so"
+                    or "globalgamemanagers" or "main.pck"
                 || path.EndsWith("assembly-csharp.dll") || path.EndsWith(".bundle") || path.EndsWith(".unity3d")
-                || path.EndsWith(".assets") || path.EndsWith(".pak") || path.EndsWith(".pck");
+                || path.EndsWith(".assets") || path.EndsWith(".pak") || path.EndsWith(".pck")
+                || path.EndsWith(".scn") || path.EndsWith(".tscn") || path.EndsWith(".res") || path.EndsWith(".tres")
+                || path.EndsWith(".uasset") || path.EndsWith(".umap");
         }).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    internal static IReadOnlyDictionary<string, int> CountExtensions(IEnumerable<string> paths)
+    {
+        return paths
+            .GroupBy(x => string.IsNullOrEmpty(Path.GetExtension(x)) ? "(无扩展名)" : Path.GetExtension(x).ToLowerInvariant())
+            .OrderByDescending(x => x.Count())
+            .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Take(100)
+            .ToDictionary(x => x.Key, x => x.Count(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    internal static async Task WriteAnalysisArtifactsAsync(AnalysisResult result, CancellationToken cancellationToken)
+    {
+        var keyDir = Path.Combine(result.JobRoot, "KeyFiles");
+        Directory.CreateDirectory(keyDir);
+        await WriteKeyIndexesAsync(keyDir, result.KeyFiles, cancellationToken);
+        await File.WriteAllTextAsync(result.ReportPath, BuildChineseReport(result), new UTF8Encoding(false), cancellationToken);
+        await File.WriteAllTextAsync(result.JsonPath, JsonSerializer.Serialize(result, JsonOptions), new UTF8Encoding(false), cancellationToken);
     }
 
     private static async Task WriteKeyIndexesAsync(string keyDir, IReadOnlyList<string> keyFiles, CancellationToken cancellationToken)
@@ -190,7 +191,9 @@ internal static class AnalysisPipeline
         var groups = new Dictionary<string, Func<string, bool>>
         {
             ["IL2CPP关键文件.txt"] = x => x.EndsWith("libil2cpp.so", StringComparison.OrdinalIgnoreCase) || x.EndsWith("global-metadata.dat", StringComparison.OrdinalIgnoreCase),
-            ["资源包索引.txt"] = x => x.EndsWith(".bundle", StringComparison.OrdinalIgnoreCase) || x.EndsWith(".unity3d", StringComparison.OrdinalIgnoreCase) || x.EndsWith(".assets", StringComparison.OrdinalIgnoreCase) || x.EndsWith(".pak", StringComparison.OrdinalIgnoreCase) || x.EndsWith(".pck", StringComparison.OrdinalIgnoreCase),
+            ["资源包索引.txt"] = x => x.EndsWith(".bundle", StringComparison.OrdinalIgnoreCase) || x.EndsWith(".unity3d", StringComparison.OrdinalIgnoreCase)
+                || x.EndsWith(".assets", StringComparison.OrdinalIgnoreCase) || x.EndsWith(".pak", StringComparison.OrdinalIgnoreCase)
+                || x.EndsWith(".pck", StringComparison.OrdinalIgnoreCase),
             ["全部关键文件.txt"] = _ => true
         };
         foreach (var group in groups)
@@ -200,15 +203,9 @@ internal static class AnalysisPipeline
         }
     }
 
-    private static string BuildChineseReport(AnalysisResult result)
+    internal static string BuildChineseReport(AnalysisResult result)
     {
-        var recommendation = result.Engine switch
-        {
-            GameEngine.Unity => "已生成 AssetRipper_Input。将整个目录交给 AssetRipper，以便同时读取 Base、ABI split 和 Asset Pack。",
-            GameEngine.Godot => "检测到 Godot。AssetRipper 面向 Unity，不适用于此样本；优先检查 .pck、.scn、.res 和 assets/.godot。",
-            GameEngine.Unreal => "检测到 Unreal Engine。AssetRipper 面向 Unity，不适用于此样本；优先检查 .pak、.uasset 和 .umap。",
-            _ => "未识别明确引擎。请从扩展名统计和关键文件索引继续判断。"
-        };
+        var recommendation = BuildRecommendation(result.Engine);
         var builder = new StringBuilder();
         builder.AppendLine("APK 下载与资源分析报告");
         builder.AppendLine("========================");
@@ -232,7 +229,15 @@ internal static class AnalysisPipeline
         return builder.ToString();
     }
 
-    private static string NormalizeSplitName(string packageName, string fileName)
+    internal static string BuildRecommendation(GameEngine engine) => engine switch
+    {
+        GameEngine.Unity => "已生成 AssetRipper_Input。将整个目录交给 AssetRipper，以便同时读取 Base、ABI split 和 Asset Pack。",
+        GameEngine.Godot => "检测到 Godot。AssetRipper 面向 Unity，不适用于此样本；优先检查 .pck、.scn、.res 和 assets/.godot。",
+        GameEngine.Unreal => "检测到 Unreal Engine。AssetRipper 面向 Unity，不适用于此样本；优先检查 .pak、.uasset 和 .umap。",
+        _ => "未识别明确引擎。请从扩展名统计和关键文件索引继续判断。"
+    };
+
+    internal static string NormalizeSplitName(string packageName, string fileName)
     {
         var stem = Path.GetFileNameWithoutExtension(fileName);
         if (stem.Equals(packageName, StringComparison.OrdinalIgnoreCase)) return "base";
@@ -240,7 +245,7 @@ internal static class AnalysisPipeline
         return SanitizeFileName(stem);
     }
 
-    private static string ClassifySplit(string packageName, string fileName)
+    internal static string ClassifySplit(string packageName, string fileName)
     {
         var stem = Path.GetFileNameWithoutExtension(fileName);
         if (stem.Equals(packageName, StringComparison.OrdinalIgnoreCase)) return "Base APK";
@@ -251,7 +256,7 @@ internal static class AnalysisPipeline
         return "附加分包";
     }
 
-    private static string MakeUniqueName(string preferred, HashSet<string> used)
+    internal static string MakeUniqueName(string preferred, HashSet<string> used)
     {
         var result = preferred;
         var index = 2;
@@ -259,7 +264,7 @@ internal static class AnalysisPipeline
         return result;
     }
 
-    private static string SanitizeFileName(string value)
+    internal static string SanitizeFileName(string value)
     {
         foreach (var invalid in Path.GetInvalidFileNameChars()) value = value.Replace(invalid, '_');
         return string.IsNullOrWhiteSpace(value) ? "split" : value;
