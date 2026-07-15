@@ -8,15 +8,15 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 9.0.x
       - name: Test
         run: dotnet run --project .\tests\ApkResourceAssistant.Tests\ApkResourceAssistant.Tests.csproj -c Release
       - name: Publish
         run: dotnet publish .\src\ApkResourceAssistant\ApkResourceAssistant.csproj -c Release -r win-x64 --self-contained true -o .\publish
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ApkResourceAssistant-win-x64
           path: .\publish\ApkResourceAssistant.exe
