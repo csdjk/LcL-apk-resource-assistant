@@ -10,13 +10,14 @@ internal sealed class MainForm : Form
     {
         None,
         ExtractDownloadedTask,
-        OpenWithAssetRipper
+        OpenWithEngineTool
     }
 
     private readonly AppSettings _settings;
     private readonly DownloadService _downloadService;
     private readonly WorkflowCoordinator _workflow = new();
     private readonly AssetRipperLauncher _assetRipperLauncher = new();
+    private readonly EngineRecoveryService _engineRecoveryService = new();
 
     private readonly TableLayoutPanel _root = new();
     private readonly Panel _workflowHost = new();
@@ -24,7 +25,7 @@ internal sealed class MainForm : Form
     [
         new(0, "下载 APK", "从 APKPure 或 Google Play 获取 APK / Split APK"),
         new(1, "解压与分析", "选择本地 APK、文件夹或以前的下载任务"),
-        new(2, "AssetRipper", "选择现有解压目录，识别后自动载入")
+        new(2, "引擎恢复", "Unity / Godot / Unreal 自动选择专用工具")
     ];
 
     private readonly ComboBox _downloadSource = new() { DropDownStyle = ComboBoxStyle.DropDownList };
@@ -45,8 +46,10 @@ internal sealed class MainForm : Form
     private readonly TextBox _assetSelection = UiTheme.TextInput(readOnly: true);
     private readonly Label _assetConfiguration = UiTheme.Caption(string.Empty);
     private readonly Button _assetSelectDirectory = UiTheme.SecondaryButton("选择目录…");
-    private readonly Button _assetLaunchOnly = UiTheme.SecondaryButton("仅启动程序");
-    private readonly Button _assetRun = UiTheme.PrimaryButton("识别并打开 AssetRipper");
+    private readonly Button _assetLaunchOnly = UiTheme.SecondaryButton("仅启动 AssetRipper");
+    private readonly Button _assetRun = UiTheme.PrimaryButton("识别并开始恢复");
+    private readonly TextBox _engineKey = UiTheme.TextInput();
+    private readonly CheckBox _unrealExtract = new() { Text = "UE：检查并解包 PAK / IoStore（推荐）", AutoSize = true, Checked = true };
 
     private readonly Label _resultTitle = UiTheme.Heading("等待开始", 12F);
     private readonly Label _resultBadge = new() { AutoSize = true, Padding = new Padding(9, 4, 9, 4) };
@@ -118,13 +121,14 @@ internal sealed class MainForm : Form
         ShowModeHint();
         foreach (var message in _startupMessages) AppendLog(message);
 
-        Shown += (_, _) => AppendLog("APK Resource Assistant v3.0.0 已就绪。可从任意阶段开始。");
+        Shown += (_, _) => AppendLog("APK Resource Assistant v4.0.0 已就绪。可从任意阶段开始。");
         FormClosing += MainFormClosing;
         FormClosed += (_, _) =>
         {
             _operationCts?.Dispose();
             _downloadService.Dispose();
             _assetRipperLauncher.Dispose();
+            _engineRecoveryService.Dispose();
         };
     }
 
@@ -139,6 +143,7 @@ internal sealed class MainForm : Form
         _downloadSplits.Checked = _settings.Split;
         _extractSelection.Text = "尚未选择。支持 APK 文件、APK 文件夹、Original_APKs 或旧任务目录。";
         _assetSelection.Text = "尚未选择。支持已有解压目录、旧任务目录或 AssetRipper_Input。";
+        _engineKey.UseSystemPasswordChar = true;
         _cancel.Enabled = false;
         _resultOpen.Enabled = false;
         _resultCopy.Enabled = false;
@@ -288,12 +293,12 @@ internal sealed class MainForm : Form
     private Control BuildAssetPanel()
     {
         var card = NewWorkflowCard();
-        var table = NewWorkflowTable(6, [48, 44, 38, 42, 44]);
+        var table = NewWorkflowTable(7, [44, 40, 34, 40, 28, 32]);
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 118));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 126));
         card.Controls.Add(table);
-        AddPanelHeader(table, "用 AssetRipper 打开", "只读扫描现有目录；Unity 自动载入，接口不兼容时透明回退。", 3);
+        AddPanelHeader(table, "引擎恢复", "Unity 使用 AssetRipper；Godot 使用 GDRETools；Unreal 使用 repak、retoc 与 FModel。", 3);
         AddField(table, 1, "解压目录", _assetSelection, 1);
         _assetSelectDirectory.Dock = DockStyle.Fill;
         _assetSelectDirectory.Margin = new Padding(8, 3, 0, 3);
@@ -304,10 +309,18 @@ internal sealed class MainForm : Form
         _assetConfiguration.TextAlign = ContentAlignment.MiddleLeft;
         table.Controls.Add(_assetConfiguration, 1, 2);
         table.SetColumnSpan(_assetConfiguration, 2);
-        var hint = UiTheme.Caption("旧任务会自动定位 AssetRipper_Input。Godot / Unreal 会给出对应建议；未知引擎继续前需要确认。");
+        var keyLabel = new Label { Text = "临时密钥", AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = UiTheme.Text };
+        table.Controls.Add(keyLabel, 0, 3);
+        _engineKey.Dock = DockStyle.Fill;
+        _engineKey.PlaceholderText = "可选：64 位十六进制 AES/PCK 密钥；只用于本次运行";
+        table.Controls.Add(_engineKey, 1, 3);
+        table.SetColumnSpan(_engineKey, 2);
+        table.Controls.Add(_unrealExtract, 1, 4);
+        table.SetColumnSpan(_unrealExtract, 2);
+        var hint = UiTheme.Caption("工具按固定版本自动下载并校验 SHA-256。Unity 的 AssetRipper 路径仍在设置中配置。");
         hint.Dock = DockStyle.Fill;
         hint.TextAlign = ContentAlignment.MiddleLeft;
-        table.Controls.Add(hint, 1, 3);
+        table.Controls.Add(hint, 1, 5);
         table.SetColumnSpan(hint, 2);
         var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Margin = new Padding(0) };
         _assetRun.Width = 210;
@@ -315,9 +328,9 @@ internal sealed class MainForm : Form
         _assetLaunchOnly.Margin = new Padding(0, 0, 10, 0);
         actions.Controls.Add(_assetRun);
         actions.Controls.Add(_assetLaunchOnly);
-        table.Controls.Add(actions, 1, 4);
+        table.Controls.Add(actions, 1, 6);
         table.SetColumnSpan(actions, 2);
-        card.Tag = WorkflowMode.OpenInAssetRipper;
+        card.Tag = WorkflowMode.RecoverResources;
         return card;
     }
 
@@ -482,7 +495,7 @@ internal sealed class MainForm : Form
         {
             WorkflowMode.Download => ("等待下载", "填写商店链接或包名，选择下载源与保存目录。下载结束只生成 Original_APKs。"),
             WorkflowMode.ExtractAnalyze => ("等待解压与分析", "选择本地 APK、APK 文件夹或以前的下载任务。外部源文件保持原样。"),
-            _ => ("等待选择目录", "选择已有解压目录、旧任务目录或 AssetRipper_Input，工具会先进行只读识别。")
+            _ => ("等待选择目录", "选择已有解压目录或旧任务目录，识别后自动选择 Unity、Godot 或 Unreal 恢复工具。")
         };
         SetResult(title, "就绪", UiTheme.PrimarySoft, UiTheme.Primary, details);
     }
@@ -572,10 +585,16 @@ internal sealed class MainForm : Form
         details.AppendLine($"分析目录：{result.InputDirectory}");
         details.Append(recommendation);
         SetResult("解压与分析完成", EngineName(result.Engine), Color.FromArgb(236, 253, 245), UiTheme.Success, details.ToString());
-        var canContinue = result.Engine is GameEngine.Unity or GameEngine.Unknown;
+        var canContinue = true;
         ConfigureResultActions(result.JobRoot, result.InputDirectory,
-            canContinue ? NextAction.OpenWithAssetRipper : NextAction.None,
-            result.Engine == GameEngine.Unity ? "继续用 AssetRipper 打开" : "继续选择 AssetRipper");
+            canContinue ? NextAction.OpenWithEngineTool : NextAction.None,
+            result.Engine switch
+            {
+                GameEngine.Unity => "继续用 AssetRipper 打开",
+                GameEngine.Godot => "继续恢复 Godot 工程",
+                GameEngine.Unreal => "继续处理 Unreal 资源",
+                _ => "继续识别恢复工具"
+            });
         SetStage($"分析完成：{EngineName(result.Engine)} / {result.ScriptingBackend}。", 100);
     }
 
@@ -594,7 +613,14 @@ internal sealed class MainForm : Form
 
             if (analysis.Engine is GameEngine.Godot or GameEngine.Unreal)
             {
-                ShowDirectoryAnalysis(analysis, false);
+                try
+                {
+                    var recovery = await _engineRecoveryService.RecoverAsync(
+                        new EngineRecoveryRequest(analysis.InputDirectory, _engineKey.Text, _unrealExtract.Checked),
+                        workflowProgress, cancellationToken);
+                    ShowEngineRecoveryResult(recovery);
+                }
+                finally { _engineKey.Clear(); }
                 return;
             }
             if (analysis.Engine == GameEngine.Unknown)
@@ -664,6 +690,23 @@ internal sealed class MainForm : Form
         SetStage(launch.Message, 100);
     }
 
+    private void ShowEngineRecoveryResult(EngineRecoveryResult recovery)
+    {
+        var details = new StringBuilder();
+        details.AppendLine($"引擎：{EngineName(recovery.Engine)}    工具：{recovery.ToolName} {recovery.ToolVersion}");
+        details.AppendLine($"输入：{recovery.InputDirectory}");
+        details.AppendLine($"输出：{recovery.OutputDirectory}");
+        if (recovery.ProcessedContainers > 0)
+            details.AppendLine($"容器：{recovery.ProcessedContainers} 个    失败：{recovery.FailedContainers} 个");
+        details.Append(recovery.Message);
+        SetResult("引擎恢复阶段完成", EngineName(recovery.Engine),
+            recovery.FailedContainers == 0 ? Color.FromArgb(236, 253, 245) : Color.FromArgb(255, 247, 237),
+            recovery.FailedContainers == 0 ? UiTheme.Success : UiTheme.Warning, details.ToString());
+        ConfigureResultActions(recovery.OutputDirectory, recovery.InputDirectory, NextAction.None, string.Empty);
+        if (recovery.Engine == GameEngine.Unreal) TryCopyPath(recovery.InputDirectory);
+        SetStage(recovery.Message, 100);
+    }
+
     private void ConfigureResultActions(string openPath, string copyPath, NextAction nextAction, string nextText)
     {
         _openPath = openPath;
@@ -698,13 +741,13 @@ internal sealed class MainForm : Form
                 if (_downloadResult != null) _extractSelection.Text = $"下载任务：{_downloadResult.JobDirectory}";
                 SelectMode(WorkflowMode.ExtractAnalyze);
                 break;
-            case NextAction.OpenWithAssetRipper:
+            case NextAction.OpenWithEngineTool:
                 if (!string.IsNullOrWhiteSpace(_copyPath))
                 {
                     _assetPath = _copyPath;
                     _assetSelection.Text = _copyPath;
                 }
-                SelectMode(WorkflowMode.OpenInAssetRipper);
+                SelectMode(WorkflowMode.RecoverResources);
                 break;
         }
     }
@@ -777,7 +820,7 @@ internal sealed class MainForm : Form
         if (e.Data?.GetData(DataFormats.FileDrop) is not string[] paths || paths.Length == 0) return;
         var apkInputs = paths.Where(path => File.Exists(path) && Path.GetExtension(path).Equals(".apk", StringComparison.OrdinalIgnoreCase)).ToList();
         var directories = paths.Where(Directory.Exists).ToList();
-        if (_mode == WorkflowMode.OpenInAssetRipper && apkInputs.Count == 0 && directories.Count == 1)
+        if (_mode == WorkflowMode.RecoverResources && apkInputs.Count == 0 && directories.Count == 1)
         {
             _assetPath = Path.GetFullPath(directories[0]);
             _assetSelection.Text = _assetPath;
@@ -880,8 +923,8 @@ internal sealed class MainForm : Form
             ? UiTheme.Warning
             : UiTheme.Muted;
         _assetConfiguration.Text = IsAssetRipperExecutable(_settings.AssetRipperPath)
-            ? $"已配置：{Path.GetFileName(_settings.AssetRipperPath)}"
-            : "尚未配置，请在右上角“设置”中选择 AssetRipper.exe。";
+            ? $"Unity：{Path.GetFileName(_settings.AssetRipperPath)}；Godot/UE 工具按需自动准备"
+            : "Unity 尚未配置 AssetRipper；Godot/UE 工具按需自动准备。";
         _assetConfiguration.ForeColor = IsAssetRipperExecutable(_settings.AssetRipperPath) ? UiTheme.Success : UiTheme.Warning;
     }
 
@@ -938,6 +981,7 @@ internal sealed class MainForm : Form
         }
         finally
         {
+            _engineKey.Clear();
             SetBusy(false);
             _operationCts.Dispose();
             _operationCts = null;
@@ -963,6 +1007,8 @@ internal sealed class MainForm : Form
         _assetSelectDirectory.Enabled = !busy;
         _assetLaunchOnly.Enabled = !busy;
         _assetRun.Enabled = !busy;
+        _engineKey.Enabled = !busy;
+        _unrealExtract.Enabled = !busy;
         _cancel.Enabled = busy;
         AllowDrop = !busy;
         UseWaitCursor = busy;
@@ -1123,7 +1169,7 @@ internal sealed class MainForm : Form
     {
         WorkflowMode.Download => "下载 APK",
         WorkflowMode.ExtractAnalyze => "解压与分析",
-        _ => "用 AssetRipper 打开"
+        _ => "引擎恢复"
     };
 
     private static string EngineName(GameEngine engine) => engine switch

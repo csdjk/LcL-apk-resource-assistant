@@ -4,7 +4,9 @@ internal enum WorkflowMode
 {
     Download,
     ExtractAnalyze,
-    OpenInAssetRipper
+    RecoverResources,
+    [Obsolete("Use RecoverResources. Retained for v3 task.json compatibility.")]
+    OpenInAssetRipper = RecoverResources
 }
 
 internal enum WorkflowTaskStatus
@@ -26,7 +28,13 @@ internal enum WorkflowStage
     ExtractingApks,
     AnalyzingFiles,
     ReadyForAssetRipper,
-    Completed
+    Completed,
+    PreparingEngineInput,
+    DownloadingTools,
+    RecoveringGodot,
+    InspectingUnreal,
+    ExtractingUnreal,
+    ReadyForEngineTool
 }
 
 internal sealed record WorkflowProgress(
@@ -38,7 +46,7 @@ internal sealed record WorkflowProgress(
 
 internal sealed record TaskManifest
 {
-    public int SchemaVersion { get; init; } = 1;
+    public int SchemaVersion { get; init; } = 2;
     public string TaskId { get; init; } = Guid.NewGuid().ToString("N");
     public string PackageName { get; init; } = "local-apk";
     public string Source { get; init; } = "本地 APK";
@@ -49,6 +57,9 @@ internal sealed record TaskManifest
     public string JobRoot { get; init; } = "";
     public string OriginalApksDirectory { get; init; } = "";
     public string? InputDirectory { get; init; }
+    public GameEngine? Engine { get; init; }
+    public string? RecoveryDirectory { get; init; }
+    public string? RecoveryTool { get; init; }
     public IReadOnlyList<string> SourceFiles { get; init; } = [];
     public IReadOnlyList<string> ImportedFromFiles { get; init; } = [];
     public DateTimeOffset CreatedAtUtc { get; init; } = DateTimeOffset.UtcNow;
@@ -91,7 +102,43 @@ internal sealed record DirectoryAnalysis(
     long TotalBytes,
     int FileCount,
     bool IsExistingTask,
-    string Recommendation);
+    string Recommendation,
+    EngineAssetInventory? EngineAssets = null);
+
+internal sealed record EngineAssetInventory(
+    IReadOnlyList<string> GodotPackages,
+    IReadOnlyList<string> UnrealPakFiles,
+    IReadOnlyList<string> UnrealUtocFiles,
+    IReadOnlyList<string> UnrealUcasFiles)
+{
+    public IReadOnlyList<string> GodotApks { get; init; } = [];
+    public static EngineAssetInventory Empty { get; } = new([], [], [], []);
+}
+
+internal sealed record EngineRecoveryRequest(
+    string SelectedPath,
+    string? TemporaryKey = null,
+    bool ExtractUnrealContainers = true);
+
+internal enum EngineRecoveryOutcome
+{
+    Completed,
+    ToolLaunched,
+    ManualFallback
+}
+
+internal sealed record EngineRecoveryResult(
+    GameEngine Engine,
+    EngineRecoveryOutcome Outcome,
+    string InputDirectory,
+    string OutputDirectory,
+    string ToolName,
+    string ToolVersion,
+    string Message,
+    string? LogPath,
+    int ProcessedContainers = 0,
+    int FailedContainers = 0,
+    bool ToolLaunched = false);
 
 internal sealed record ResolvedAnalysisDirectory(
     string SelectedPath,

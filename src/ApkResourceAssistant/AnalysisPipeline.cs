@@ -28,11 +28,12 @@ internal sealed record AnalysisResult(
     IReadOnlyList<string> KeyFiles,
     IReadOnlyDictionary<string, int> ExtensionCounts,
     long ExtractedBytes,
-    int ExtractedFiles);
+    int ExtractedFiles,
+    EngineAssetInventory? EngineAssets = null);
 
 /// <summary>
 /// Backwards-compatible facade retained for the v2 UI and existing integrations.
-/// The v3 UI should call <see cref="WorkflowCoordinator"/> directly.
+/// The staged v4 UI should call <see cref="WorkflowCoordinator"/> directly.
 /// </summary>
 internal static class AnalysisPipeline
 {
@@ -134,7 +135,8 @@ internal static class AnalysisPipeline
             if (path.Contains("assets/bin/data/") || path.EndsWith("data.unity3d") || path.EndsWith(".assets") || path.EndsWith(".bundle")) unity += 3;
             if (path.Contains("/.godot/") || path.StartsWith(".godot/") || path.EndsWith(".pck") || name.Contains("godot")) godot += 8;
             if (path.EndsWith(".scn") || path.EndsWith(".tscn") || path.EndsWith(".res") || path.EndsWith(".tres")) godot += 2;
-            if (path.EndsWith(".pak") || name is "libue4.so" or "libunreal.so" || path.Contains("ue4game/") || path.Contains("unrealengine/")) unreal += 8;
+            if (path.EndsWith(".pak") || path.EndsWith(".utoc") || path.EndsWith(".ucas")
+                || name is "libue4.so" or "libunreal.so" || path.Contains("ue4game/") || path.Contains("unrealengine/")) unreal += 8;
             if (path.EndsWith(".uasset") || path.EndsWith(".umap")) unreal += 3;
         }
         var best = Math.Max(unity, Math.Max(godot, unreal));
@@ -161,7 +163,7 @@ internal static class AnalysisPipeline
             return name is "libil2cpp.so" or "global-metadata.dat" or "libunity.so" or "libue4.so" or "libunreal.so"
                     or "globalgamemanagers" or "main.pck"
                 || path.EndsWith("assembly-csharp.dll") || path.EndsWith(".bundle") || path.EndsWith(".unity3d")
-                || path.EndsWith(".assets") || path.EndsWith(".pak") || path.EndsWith(".pck")
+                || path.EndsWith(".assets") || path.EndsWith(".pak") || path.EndsWith(".utoc") || path.EndsWith(".ucas") || path.EndsWith(".pck")
                 || path.EndsWith(".scn") || path.EndsWith(".tscn") || path.EndsWith(".res") || path.EndsWith(".tres")
                 || path.EndsWith(".uasset") || path.EndsWith(".umap");
         }).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
@@ -193,6 +195,7 @@ internal static class AnalysisPipeline
             ["IL2CPP关键文件.txt"] = x => x.EndsWith("libil2cpp.so", StringComparison.OrdinalIgnoreCase) || x.EndsWith("global-metadata.dat", StringComparison.OrdinalIgnoreCase),
             ["资源包索引.txt"] = x => x.EndsWith(".bundle", StringComparison.OrdinalIgnoreCase) || x.EndsWith(".unity3d", StringComparison.OrdinalIgnoreCase)
                 || x.EndsWith(".assets", StringComparison.OrdinalIgnoreCase) || x.EndsWith(".pak", StringComparison.OrdinalIgnoreCase)
+                || x.EndsWith(".utoc", StringComparison.OrdinalIgnoreCase) || x.EndsWith(".ucas", StringComparison.OrdinalIgnoreCase)
                 || x.EndsWith(".pck", StringComparison.OrdinalIgnoreCase),
             ["全部关键文件.txt"] = _ => true
         };
@@ -215,6 +218,8 @@ internal static class AnalysisPipeline
         builder.AppendLine($"脚本后端：{result.ScriptingBackend}");
         builder.AppendLine($"APK 数量：{result.Splits.Count}");
         builder.AppendLine($"解压文件：{result.ExtractedFiles}（{FormatBytes(result.ExtractedBytes)}）");
+        if (result.EngineAssets != null)
+            builder.AppendLine($"引擎容器：Godot {result.EngineAssets.GodotPackages.Count} / PAK {result.EngineAssets.UnrealPakFiles.Count} / IoStore {result.EngineAssets.UnrealUtocFiles.Count}");
         builder.AppendLine();
         builder.AppendLine("分包：");
         foreach (var split in result.Splits) builder.AppendLine($"- [{split.Kind}] {split.FileName} ({FormatBytes(split.Size)})");
@@ -232,8 +237,8 @@ internal static class AnalysisPipeline
     internal static string BuildRecommendation(GameEngine engine) => engine switch
     {
         GameEngine.Unity => "已生成 AssetRipper_Input。将整个目录交给 AssetRipper，以便同时读取 Base、ABI split 和 Asset Pack。",
-        GameEngine.Godot => "检测到 Godot。AssetRipper 面向 Unity，不适用于此样本；优先检查 .pck、.scn、.res 和 assets/.godot。",
-        GameEngine.Unreal => "检测到 Unreal Engine。AssetRipper 面向 Unity，不适用于此样本；优先检查 .pak、.uasset 和 .umap。",
+        GameEngine.Godot => "检测到 Godot。可使用 GDRETools 从 APK、PCK 或解压目录恢复 Godot_Recovered 工程。",
+        GameEngine.Unreal => "检测到 Unreal Engine。可使用 repak 处理 PAK、retoc 处理 UE5 IoStore（UTOC/UCAS），并用 FModel 浏览资源。",
         _ => "未识别明确引擎。请从扩展名统计和关键文件索引继续判断。"
     };
 

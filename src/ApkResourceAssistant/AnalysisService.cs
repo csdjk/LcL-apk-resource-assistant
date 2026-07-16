@@ -40,10 +40,12 @@ internal sealed class AnalysisService
                 scan.KeyFiles,
                 scan.ExtensionCounts,
                 extraction.ExtractedBytes,
-                extraction.ExtractedFiles);
+                extraction.ExtractedFiles,
+                BuildEngineInventory(extraction.InputDirectory, scan.RelativeFiles, extraction.JobRoot));
 
             progress?.Report(new WorkflowProgress(WorkflowStage.AnalyzingFiles, "生成分析报告", 90));
             await AnalysisPipeline.WriteAnalysisArtifactsAsync(result, cancellationToken);
+            manifest = manifest with { SchemaVersion = 2, Engine = result.Engine };
             manifest = await TaskManifestStore.TransitionAsync(manifest, WorkflowStage.ReadyForAssetRipper,
                 completedStage: WorkflowStage.AnalyzingFiles, inputDirectory: extraction.InputDirectory,
                 cancellationToken: cancellationToken);
@@ -90,7 +92,8 @@ internal sealed class AnalysisService
             scan.TotalBytes,
             scan.FileCount,
             resolved.IsExistingTask,
-            AnalysisPipeline.BuildRecommendation(scan.Engine));
+            AnalysisPipeline.BuildRecommendation(scan.Engine),
+            BuildEngineInventory(resolved.InputDirectory, scan.RelativeFiles, resolved.TaskRoot));
     }
 
     public async Task<ResolvedAnalysisDirectory> ResolveInputDirectoryAsync(
@@ -112,9 +115,12 @@ internal sealed class AnalysisService
         if (!Directory.Exists(selected)) throw new DirectoryNotFoundException($"找不到目录：{selected}");
 
         cancellationToken.ThrowIfCancellationRequested();
-        var isInputDirectory = Path.GetFileName(selected).Equals("AssetRipper_Input", StringComparison.OrdinalIgnoreCase);
+        var isInputDirectory = Path.GetFileName(selected).Equals("AssetRipper_Input", StringComparison.OrdinalIgnoreCase)
+            || Path.GetFileName(selected).Equals("Extracted", StringComparison.OrdinalIgnoreCase);
         var taskRoot = isInputDirectory ? Directory.GetParent(selected)?.FullName : selected;
-        var inputDirectory = isInputDirectory ? selected : Path.Combine(selected, "AssetRipper_Input");
+        var inputDirectory = isInputDirectory ? selected : Path.Combine(selected, "Extracted");
+        if (!Directory.Exists(inputDirectory) && !isInputDirectory)
+            inputDirectory = Path.Combine(selected, "AssetRipper_Input");
         var taskJson = taskRoot == null ? null : Path.Combine(taskRoot, "task.json");
         var analysisJson = taskRoot == null ? null : Path.Combine(taskRoot, "analysis.json");
         if (explicitlySelectedMetadata != null)
@@ -177,7 +183,31 @@ internal sealed class AnalysisService
         var backend = AnalysisPipeline.DetectScriptingBackend(relativeFiles);
         var keyFiles = AnalysisPipeline.FindKeyFiles(relativeFiles);
         var extensions = AnalysisPipeline.CountExtensions(relativeFiles);
-        return new ScanResult(engine, backend, keyFiles, extensions, totalBytes, count);
+        return new ScanResult(engine, backend, keyFiles, extensions, totalBytes, count, relativeFiles);
+    }
+
+    private static EngineAssetInventory BuildEngineInventory(string root, IReadOnlyList<string> relativeFiles, string? taskRoot)
+    {
+        string[] Select(params string[] extensions) => relativeFiles
+            .Where(path => extensions.Any(extension => path.EndsWith(extension, StringComparison.OrdinalIgnoreCase)))
+            .Select(path => Path.GetFullPath(Path.Combine(root, path.Replace('/', Path.DirectorySeparatorChar))))
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var godot = Select(".pck").ToList();
+        foreach (var marker in relativeFiles.Where(path => path.EndsWith("project.godot", StringComparison.OrdinalIgnoreCase)
+                     || path.EndsWith("project.binary", StringComparison.OrdinalIgnoreCase)))
+        {
+            var directory = Path.GetDirectoryName(Path.Combine(root, marker.Replace('/', Path.DirectorySeparatorChar)));
+            if (directory != null && !godot.Contains(directory, StringComparer.OrdinalIgnoreCase)) godot.Add(directory);
+        }
+        var godotApks = taskRoot == null ? [] : Directory.Exists(Path.Combine(taskRoot, "Original_APKs"))
+            ? Directory.EnumerateFiles(Path.Combine(taskRoot, "Original_APKs"), "*.apk", SearchOption.TopDirectoryOnly)
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray()
+            : [];
+        return new EngineAssetInventory(godot, Select(".pak"), Select(".utoc"), Select(".ucas"))
+        {
+            GodotApks = godotApks
+        };
     }
 
     private static async Task<Metadata> ReadMetadataAsync(string path, CancellationToken cancellationToken)
@@ -219,7 +249,8 @@ internal sealed class AnalysisService
         IReadOnlyList<string> KeyFiles,
         IReadOnlyDictionary<string, int> ExtensionCounts,
         long TotalBytes,
-        int FileCount);
+        int FileCount,
+        IReadOnlyList<string> RelativeFiles);
 
     private readonly record struct Metadata(string? InputDirectory, string? PackageName, string? Source);
 }

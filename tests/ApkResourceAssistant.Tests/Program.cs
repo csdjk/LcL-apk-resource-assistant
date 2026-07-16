@@ -14,14 +14,259 @@ try
     await TestExternalApkCreatesNewTaskWithoutChangingSourceAsync(root);
     await TestDownloadedTaskContinuesInPlaceAsync(root);
     await TestExistingDirectoryScanIsReadOnlyAsync(root);
+    await TestV3TaskManifestCompatibilityAsync(root);
+    await TestV3SettingsMigrationAsync(root);
     await TestAssetRipperAutoLoadAndReuseAsync(root);
     await TestAssetRipperFallbackAsync(root);
+    await TestExternalToolVerificationAsync(root);
+    await TestExternalToolZipTraversalAsync(root);
+    await TestExternalToolDownloadFailureAsync(root);
+    await TestProcessRedactionAndCancellationAsync(root);
+    await TestGodotRecoveryAsync(root);
+    await TestGodotRecoveryFallbackAsync(root);
+    await TestUnrealPakRecoveryAsync(root);
+    await TestUnrealIoStoreRecoveryAsync(root);
+    await TestUnrealEncryptedAndDamagedContainerAsync(root);
+    await TestRecoveryCancellationAsync(root);
     await TestGodotSampleAsync(root);
     Console.WriteLine("ALL TESTS PASSED");
 }
 finally
 {
     try { Directory.Delete(root, true); } catch { }
+}
+
+static async Task TestExternalToolVerificationAsync(string root)
+{
+    var archivePath = Path.Combine(root, "tool-fixture.zip");
+    CreateZip(archivePath, new Dictionary<string, string> { ["tool.exe"] = "fixture" });
+    var bytes = await File.ReadAllBytesAsync(archivePath);
+    var hash = Convert.ToHexString(SHA256.HashData(bytes));
+    var spec = new ExternalToolSpec(ExternalToolId.GdreTools, "fixture", "1.0", "https://fixture/tool.zip", hash, "tool.exe");
+    using var http = new HttpClient(new StaticContentHandler(bytes));
+    using var manager = new ExternalToolManager(Path.Combine(root, "tool-cache"), http,
+        new Dictionary<ExternalToolId, ExternalToolSpec> { [ExternalToolId.GdreTools] = spec });
+    var installed = await manager.EnsureInstalledAsync(ExternalToolId.GdreTools);
+    Assert(File.Exists(installed.ExecutablePath), "verified tool installed");
+    await File.WriteAllTextAsync(installed.ExecutablePath, "tampered");
+    installed = await manager.EnsureInstalledAsync(ExternalToolId.GdreTools);
+    Assert(File.ReadAllText(installed.ExecutablePath) == "fixture", "tampered tool cache repaired");
+
+    var bad = spec with { ArchiveSha256 = new string('0', 64) };
+    using var badHttp = new HttpClient(new StaticContentHandler(bytes));
+    using var badManager = new ExternalToolManager(Path.Combine(root, "bad-tool-cache"), badHttp,
+        new Dictionary<ExternalToolId, ExternalToolSpec> { [ExternalToolId.GdreTools] = bad });
+    var threw = false;
+    try { await badManager.EnsureInstalledAsync(ExternalToolId.GdreTools); }
+    catch (InvalidDataException) { threw = true; }
+    Assert(threw, "tool SHA-256 mismatch rejected");
+    Console.WriteLine("PASS external tool verification");
+}
+
+static async Task TestV3TaskManifestCompatibilityAsync(string root)
+{
+    var taskRoot = Path.Combine(root, "v3-manifest");
+    Directory.CreateDirectory(taskRoot);
+    await File.WriteAllTextAsync(Path.Combine(taskRoot, "task.json"), $$"""
+    {
+      "SchemaVersion": 1,
+      "TaskId": "legacy",
+      "PackageName": "com.example.legacy",
+      "Mode": "OpenInAssetRipper",
+      "Status": "Completed",
+      "CurrentStage": "ReadyForAssetRipper",
+      "JobRoot": "{{taskRoot.Replace("\\", "\\\\")}}",
+      "OriginalApksDirectory": "{{Path.Combine(taskRoot, "Original_APKs").Replace("\\", "\\\\")}}"
+    }
+    """);
+    var manifest = await TaskManifestStore.TryLoadAsync(taskRoot);
+    Assert(manifest != null && (int)manifest.Mode == (int)WorkflowMode.RecoverResources,
+        "v3 OpenInAssetRipper manifest migrates to recovery stage");
+    Console.WriteLine("PASS v3 task manifest compatibility");
+}
+
+static async Task TestV3SettingsMigrationAsync(string root)
+{
+    var path = Path.Combine(root, "settings-v3.json");
+    await File.WriteAllTextAsync(path, """
+    {
+      "SchemaVersion": 3,
+      "Email": "fixture@example.com",
+      "OutputDir": "C:\\APK",
+      "Split": false,
+      "Source": 2,
+      "AssetRipperPath": "C:\\Tools\\AssetRipper.exe",
+      "RememberCredentials": false,
+      "LastMode": 2
+    }
+    """);
+    var settings = SettingsStore.LoadFromFile(path);
+    Assert(settings.SchemaVersion == 3 && settings.Source == 2 && !settings.Split,
+        "v3 settings values loaded");
+    Assert(settings.LastMode == (int)WorkflowMode.RecoverResources &&
+           settings.AssetRipperPath?.EndsWith("AssetRipper.exe", StringComparison.OrdinalIgnoreCase) == true,
+        "v3 settings migrate third stage and AssetRipper path");
+    Console.WriteLine("PASS v3 settings migration");
+}
+
+static async Task TestExternalToolDownloadFailureAsync(string root)
+{
+    var spec = new ExternalToolSpec(ExternalToolId.Repak, "fixture", "1.0", "https://fixture/fail.zip",
+        new string('0', 64), "tool.exe");
+    using var http = new HttpClient(new StatusCodeHandler(HttpStatusCode.ServiceUnavailable));
+    using var manager = new ExternalToolManager(Path.Combine(root, "failed-download-cache"), http,
+        new Dictionary<ExternalToolId, ExternalToolSpec> { [ExternalToolId.Repak] = spec });
+    var threw = false;
+    try { await manager.EnsureInstalledAsync(ExternalToolId.Repak); }
+    catch (HttpRequestException) { threw = true; }
+    Assert(threw, "external tool HTTP failure reported");
+    Assert(!Directory.EnumerateFiles(Path.Combine(root, "failed-download-cache"), "*.download", SearchOption.AllDirectories).Any(),
+        "failed tool download leaves no partial archive");
+    Console.WriteLine("PASS external tool download failure cleanup");
+}
+
+static Task TestExternalToolZipTraversalAsync(string root)
+{
+    var archive = Path.Combine(root, "malicious-tool.zip");
+    using (var zip = ZipFile.Open(archive, ZipArchiveMode.Create))
+    {
+        using var writer = new StreamWriter(zip.CreateEntry("../tool.exe").Open());
+        writer.Write("bad");
+    }
+    var destination = Path.Combine(root, "safe-tool-extract");
+    Directory.CreateDirectory(destination);
+    var threw = false;
+    try { ExternalToolManager.ExtractZipSafely(archive, destination, CancellationToken.None); }
+    catch (InvalidDataException) { threw = true; }
+    Assert(threw && !File.Exists(Path.Combine(root, "tool.exe")), "external tool ZIP traversal rejected");
+    Console.WriteLine("PASS external tool ZIP traversal protection");
+    return Task.CompletedTask;
+}
+
+static async Task TestProcessRedactionAndCancellationAsync(string root)
+{
+    const string secret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    var log = Path.Combine(root, "redaction.log");
+    var runner = new ExternalProcessRunner();
+    var result = await runner.RunAsync(new ExternalProcessRequest("powershell.exe",
+        ["-NoProfile", "-Command", $"Write-Output '{secret}'"], root, log, [secret]));
+    Assert(result.ExitCode == 0 && !result.StandardOutput.Contains(secret), "process output secret redacted");
+    Assert(!File.ReadAllText(log).Contains(secret), "process log secret redacted");
+    using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
+    var cancelled = false;
+    try
+    {
+        await runner.RunAsync(new ExternalProcessRequest("powershell.exe",
+            ["-NoProfile", "-Command", "Start-Sleep -Seconds 10"], root), cancellationToken: cts.Token);
+    }
+    catch (OperationCanceledException) { cancelled = true; }
+    Assert(cancelled, "external process cancellation kills process tree");
+    Console.WriteLine("PASS process redaction and cancellation");
+}
+
+static async Task TestGodotRecoveryAsync(string root)
+{
+    var input = Path.Combine(root, "godot-recovery", "Extracted");
+    Directory.CreateDirectory(Path.Combine(input, "assetpack", "assets", ".godot"));
+    await File.WriteAllTextAsync(Path.Combine(input, "assetpack", "assets", ".godot", "uid_cache.bin"), "cache");
+    await File.WriteAllTextAsync(Path.Combine(input, "assetpack", "assets", "main.scn"), "scene");
+    var tools = new FakeToolProvider(Path.Combine(root, "fake-tools"));
+    var processes = new FakeRecoveryProcessRunner();
+    var service = new EngineRecoveryService(new AnalysisService(), tools, processes);
+    var key = new string('A', 64);
+    var result = await service.RecoverAsync(new EngineRecoveryRequest(input, key));
+    Assert(result.Engine == GameEngine.Godot && File.Exists(Path.Combine(result.OutputDirectory, "project.godot")),
+        "GDRETools Godot recovery output");
+    Assert(processes.Requests.Single().Arguments.Any(arg => arg.StartsWith("--recover=")), "GDRETools recover argument");
+    Assert(!File.ReadAllText(Path.Combine(Directory.GetParent(result.OutputDirectory)!.FullName, "engine-recovery.json")).Contains(key),
+        "Godot temporary key not persisted");
+    Console.WriteLine("PASS Godot recovery dispatcher");
+}
+
+static async Task TestGodotRecoveryFallbackAsync(string root)
+{
+    var input = Path.Combine(root, "godot-fallback", "Extracted");
+    Directory.CreateDirectory(Path.Combine(input, ".godot"));
+    await File.WriteAllTextAsync(Path.Combine(input, ".godot", "uid_cache.bin"), "cache");
+    var launched = 0;
+    var service = new EngineRecoveryService(new AnalysisService(),
+        new FakeToolProvider(Path.Combine(root, "fake-tools-godot-fallback")),
+        new FakeRecoveryProcessRunner { ExitCode = 9 }, (_, _) => launched++);
+    var result = await service.RecoverAsync(new EngineRecoveryRequest(input));
+    Assert(result.Outcome == EngineRecoveryOutcome.ManualFallback && result.ToolLaunched && launched == 1,
+        "GDRETools headless failure launches GUI fallback");
+    Console.WriteLine("PASS Godot recovery GUI fallback");
+}
+
+static async Task TestUnrealPakRecoveryAsync(string root)
+{
+    var input = Path.Combine(root, "ue4-recovery", "Extracted");
+    Directory.CreateDirectory(Path.Combine(input, "base", "assets"));
+    await File.WriteAllTextAsync(Path.Combine(input, "base", "assets", "game.pak"), "pak");
+    await File.WriteAllTextAsync(Path.Combine(input, "base", "libUE4.so"), "ue");
+    var processes = new FakeRecoveryProcessRunner();
+    var launched = 0;
+    var service = new EngineRecoveryService(new AnalysisService(), new FakeToolProvider(Path.Combine(root, "fake-tools-ue4")),
+        processes, (_, _) => launched++);
+    var result = await service.RecoverAsync(new EngineRecoveryRequest(input));
+    Assert(result.Engine == GameEngine.Unreal && result.ProcessedContainers == 1 && launched == 1,
+        "UE4 PAK recovery and FModel launch");
+    Assert(processes.Requests.Any(request => request.Arguments.Contains("info"))
+           && processes.Requests.Any(request => request.Arguments.Contains("unpack")), "repak info and unpack commands");
+    Console.WriteLine("PASS Unreal PAK recovery dispatcher");
+}
+
+static async Task TestUnrealEncryptedAndDamagedContainerAsync(string root)
+{
+    var input = Path.Combine(root, "ue-encrypted-damaged", "Extracted");
+    Directory.CreateDirectory(input);
+    await File.WriteAllTextAsync(Path.Combine(input, "encrypted.pak"), "damaged fixture");
+    var key = new string('B', 64);
+    var processes = new FakeRecoveryProcessRunner { ExitCode = 7 };
+    var launched = 0;
+    var service = new EngineRecoveryService(new AnalysisService(),
+        new FakeToolProvider(Path.Combine(root, "fake-tools-ue-damaged")), processes, (_, _) => launched++);
+    var result = await service.RecoverAsync(new EngineRecoveryRequest(input, key));
+    Assert(result.Outcome == EngineRecoveryOutcome.ManualFallback && result.FailedContainers == 1 && launched == 1,
+        "damaged encrypted PAK falls back to FModel");
+    Assert(processes.Requests.Any(request => request.Arguments.Contains("--aes-key") && request.Arguments.Contains(key)),
+        "temporary Unreal AES key passed to repak");
+    var recoveryJson = Path.Combine(Directory.GetParent(result.OutputDirectory)!.FullName, "engine-recovery.json");
+    Assert(File.Exists(recoveryJson) && !File.ReadAllText(recoveryJson).Contains(key),
+        "Unreal temporary AES key not persisted");
+    Console.WriteLine("PASS encrypted and damaged Unreal container fallback");
+}
+
+static async Task TestRecoveryCancellationAsync(string root)
+{
+    var input = Path.Combine(root, "cancel-recovery", "Extracted");
+    Directory.CreateDirectory(Path.Combine(input, ".godot"));
+    await File.WriteAllTextAsync(Path.Combine(input, ".godot", "uid_cache.bin"), "cache");
+    var processes = new FakeRecoveryProcessRunner { BlockUntilCancelled = true };
+    var service = new EngineRecoveryService(new AnalysisService(),
+        new FakeToolProvider(Path.Combine(root, "fake-tools-cancel")), processes);
+    using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+    var cancelled = false;
+    try { await service.RecoverAsync(new EngineRecoveryRequest(input), cancellationToken: cts.Token); }
+    catch (OperationCanceledException) { cancelled = true; }
+    Assert(cancelled && processes.Requests.Count == 1, "engine recovery cancellation reaches child process");
+    Console.WriteLine("PASS engine recovery cancellation");
+}
+
+static async Task TestUnrealIoStoreRecoveryAsync(string root)
+{
+    var input = Path.Combine(root, "ue5-recovery", "Extracted");
+    Directory.CreateDirectory(Path.Combine(input, "base", "assets"));
+    await File.WriteAllTextAsync(Path.Combine(input, "base", "assets", "global.utoc"), "utoc");
+    await File.WriteAllTextAsync(Path.Combine(input, "base", "assets", "global.ucas"), "ucas");
+    var processes = new FakeRecoveryProcessRunner();
+    var service = new EngineRecoveryService(new AnalysisService(), new FakeToolProvider(Path.Combine(root, "fake-tools-ue5")),
+        processes, (_, _) => { });
+    var result = await service.RecoverAsync(new EngineRecoveryRequest(input));
+    Assert(result.ProcessedContainers == 1, "UE5 IoStore container count");
+    Assert(processes.Requests.Any(request => request.Arguments.Contains("verify"))
+           && processes.Requests.Any(request => request.Arguments.Contains("unpack")), "retoc verify and unpack commands");
+    Console.WriteLine("PASS Unreal IoStore recovery dispatcher");
 }
 
 static async Task TestUnitySplitAsync(string root)
@@ -109,7 +354,7 @@ static async Task TestGodotSampleAsync(string root)
     Assert(result.Engine == GameEngine.Godot, "Godot engine detection");
     Assert(result.Splits.Count == 5, "Godot split count");
     Assert(Directory.EnumerateFiles(result.InputDirectory, "*.scn", SearchOption.AllDirectories).Any(), "Godot scenes extracted");
-    Assert(File.ReadAllText(result.ReportPath).Contains("AssetRipper 面向 Unity"), "Godot AssetRipper warning");
+    Assert(File.ReadAllText(result.ReportPath).Contains("GDRETools"), "Godot recovery recommendation");
     Console.WriteLine("PASS real Godot split sample");
 }
 
@@ -424,6 +669,78 @@ internal sealed class RecordingAssetRipperHandler(bool failLoadFolder = false) :
                 };
         response.RequestMessage = request;
         return response;
+    }
+}
+
+internal sealed class StaticContentHandler(byte[] content) : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+        Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new ByteArrayContent(content),
+            RequestMessage = request
+        });
+}
+
+internal sealed class StatusCodeHandler(HttpStatusCode statusCode) : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+        Task.FromResult(new HttpResponseMessage(statusCode) { RequestMessage = request });
+}
+
+internal sealed class FakeToolProvider(string root) : IExternalToolProvider
+{
+    public Task<ExternalToolInstallation> EnsureInstalledAsync(ExternalToolId id,
+        IProgress<ExternalToolProgress>? progress = null, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var spec = ExternalToolManager.Catalog[id];
+        var directory = Path.Combine(root, id.ToString());
+        Directory.CreateDirectory(directory);
+        var executable = Path.Combine(directory, spec.ExecutableName);
+        File.WriteAllBytes(executable, []);
+        return Task.FromResult(new ExternalToolInstallation(spec, directory, executable));
+    }
+}
+
+internal sealed class FakeRecoveryProcessRunner : IExternalProcessRunner
+{
+    public List<ExternalProcessRequest> Requests { get; } = [];
+    public int ExitCode { get; init; }
+    public bool BlockUntilCancelled { get; init; }
+
+    public async Task<ExternalProcessResult> RunAsync(ExternalProcessRequest request, Action<string>? output = null,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Requests.Add(request);
+        if (BlockUntilCancelled) await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        var gdreOutput = request.Arguments.FirstOrDefault(arg => arg.StartsWith("--output=", StringComparison.Ordinal));
+        if (gdreOutput != null)
+        {
+            var directory = gdreOutput[9..];
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(Path.Combine(directory, "project.godot"), "[application]");
+        }
+        var outputIndex = request.Arguments.ToList().IndexOf("--output");
+        if (outputIndex >= 0 && outputIndex + 1 < request.Arguments.Count)
+        {
+            Directory.CreateDirectory(request.Arguments[outputIndex + 1]);
+            File.WriteAllText(Path.Combine(request.Arguments[outputIndex + 1], "asset.uasset"), "asset");
+        }
+        var unpackIndex = request.Arguments.ToList().IndexOf("unpack");
+        if (unpackIndex >= 0 && request.ExecutablePath.EndsWith("retoc.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            var directory = request.Arguments[^1];
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(Path.Combine(directory, "chunk.bin"), "chunk");
+        }
+        if (request.LogPath != null)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(request.LogPath)!);
+            File.WriteAllText(request.LogPath, "fixture log");
+        }
+        return new ExternalProcessResult(ExitCode, ExitCode == 0 ? "ok" : "", ExitCode == 0 ? "" : "damaged fixture");
     }
 }
 

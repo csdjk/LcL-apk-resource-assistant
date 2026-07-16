@@ -7,7 +7,7 @@ namespace GooglePlayApkDownloader;
 
 internal sealed class AppSettings
 {
-    public int SchemaVersion { get; set; } = 3;
+    public int SchemaVersion { get; set; } = 4;
     public string? Email { get; set; }
     public string? OutputDir { get; set; }
     public bool Split { get; set; } = true;
@@ -33,13 +33,16 @@ internal static class SettingsStore
     internal static readonly string SettingsPath = Path.Combine(AppDirectory, "settings.json");
 
     public static AppSettings Load(Action<string>? log = null)
+        => LoadFromFile(SettingsPath, log);
+
+    internal static AppSettings LoadFromFile(string path, Action<string>? log = null)
     {
         var settings = new AppSettings();
         try
         {
-            if (!File.Exists(SettingsPath)) return settings;
+            if (!File.Exists(path)) return settings;
 
-            using var document = JsonDocument.Parse(File.ReadAllText(SettingsPath));
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
             var root = document.RootElement;
             settings.SchemaVersion = GetInt(root, "SchemaVersion", 1);
             settings.Email = GetString(root, "Email");
@@ -73,7 +76,7 @@ internal static class SettingsStore
     public static void Save(AppSettings settings)
     {
         Directory.CreateDirectory(AppDirectory);
-        settings.SchemaVersion = 3;
+        settings.SchemaVersion = 4;
         if (!settings.RememberCredentials)
         {
             settings.ProtectedToken = null;
