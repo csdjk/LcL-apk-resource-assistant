@@ -669,15 +669,17 @@ internal sealed class DownloadService : IDisposable
 
     private static string CreateUniqueJobDirectory(string outputRoot, string packageName)
     {
-        var packageRoot = Path.Combine(outputRoot, packageName);
+        var root = Path.GetFullPath(outputRoot);
+        var safePackage = AnalysisPipeline.SanitizeFileName(packageName);
         lock (JobDirectoryLock)
         {
-            Directory.CreateDirectory(packageRoot);
+            Directory.CreateDirectory(root);
             var timestamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
-            var candidate = Path.Combine(packageRoot, timestamp);
+            var taskName = $"{safePackage}_{timestamp}";
+            var candidate = Path.Combine(root, taskName);
             var suffix = 2;
             while (Directory.Exists(candidate))
-                candidate = Path.Combine(packageRoot, $"{timestamp}-{suffix++}");
+                candidate = Path.Combine(root, $"{taskName}-{suffix++}");
             Directory.CreateDirectory(candidate);
             return candidate;
         }

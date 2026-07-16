@@ -7,7 +7,7 @@ namespace GooglePlayApkDownloader;
 
 internal sealed class AppSettings
 {
-    public int SchemaVersion { get; set; } = 4;
+    public int SchemaVersion { get; set; } = 5;
     public string? Email { get; set; }
     public string? OutputDir { get; set; }
     public bool Split { get; set; } = true;
@@ -16,6 +16,9 @@ internal sealed class AppSettings
     public string? ProtectedToken { get; set; }
     public bool RememberCredentials { get; set; } = true;
     public int LastMode { get; set; }
+    public int DownloadPaneHeight { get; set; } = 340;
+    public int ExtractAnalyzePaneHeight { get; set; } = 310;
+    public int RecoveryPaneHeight { get; set; } = 330;
 
     [JsonIgnore]
     public string Token { get; set; } = string.Empty;
@@ -53,6 +56,9 @@ internal static class SettingsStore
             settings.ProtectedToken = GetString(root, "ProtectedToken");
             settings.RememberCredentials = GetBool(root, "RememberCredentials", !string.IsNullOrEmpty(settings.ProtectedToken));
             settings.LastMode = Math.Clamp(GetInt(root, "LastMode", 0), 0, 2);
+            settings.DownloadPaneHeight = Math.Clamp(GetInt(root, "DownloadPaneHeight", 340), 220, 520);
+            settings.ExtractAnalyzePaneHeight = Math.Clamp(GetInt(root, "ExtractAnalyzePaneHeight", 310), 220, 520);
+            settings.RecoveryPaneHeight = Math.Clamp(GetInt(root, "RecoveryPaneHeight", 330), 220, 520);
             if (!string.IsNullOrEmpty(settings.ProtectedToken))
             {
                 try
@@ -76,7 +82,7 @@ internal static class SettingsStore
     public static void Save(AppSettings settings)
     {
         Directory.CreateDirectory(AppDirectory);
-        settings.SchemaVersion = 4;
+        settings.SchemaVersion = 5;
         if (!settings.RememberCredentials)
         {
             settings.ProtectedToken = null;

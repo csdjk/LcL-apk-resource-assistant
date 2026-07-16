@@ -1,6 +1,7 @@
 using System.IO.Compression;
 using System.Net;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using GooglePlayApkDownloader;
 
@@ -9,6 +10,11 @@ Directory.CreateDirectory(root);
 try
 {
     await TestUnitySplitAsync(root);
+    await TestGodotVersionIntelligenceAsync(root);
+    await TestUnityVersionIntelligenceAsync(root);
+    await TestUnrealVersionIntelligenceAsync(root);
+    await TestAnalysisJsonKeyFileLimitAsync(root);
+    await TestRecentTaskIndexAsync(root);
     await TestZipTraversalAsync(root);
     await TestCorruptApkAsync(root);
     await TestExternalApkCreatesNewTaskWithoutChangingSourceAsync(root);
@@ -63,6 +69,160 @@ static async Task TestExternalToolVerificationAsync(string root)
     Console.WriteLine("PASS external tool verification");
 }
 
+static async Task TestGodotVersionIntelligenceAsync(string root)
+{
+    var taskRoot = Path.Combine(root, "godot-version-intelligence");
+    var input = Path.Combine(taskRoot, "Extracted");
+    var native = Path.Combine(input, "config.arm64_v8a", "lib", "arm64-v8a");
+    var assets = Path.Combine(input, "assetpack", "assets", ".godot");
+    Directory.CreateDirectory(native);
+    Directory.CreateDirectory(assets);
+    await File.WriteAllBytesAsync(Path.Combine(native, "libgodot_android.so"),
+        Encoding.ASCII.GetBytes("prefix\0Godot Engine v4.6.1.stable.custom_build\0suffix"));
+    await File.WriteAllTextAsync(Path.Combine(assets, "main.gdc"), "bytecode");
+    Directory.CreateDirectory(Path.Combine(taskRoot, "Logs"));
+    await File.WriteAllTextAsync(Path.Combine(taskRoot, "Logs", "gdre-tools.log"),
+        "Detected Engine Version: 4.5.0\nDetected Bytecode Revision: 4.5.0-stable (fixture)");
+    await TaskManifestStore.SaveAsync(new TaskManifest
+    {
+        JobRoot = taskRoot,
+        PackageName = "com.example.godot",
+        OriginalApksDirectory = Path.Combine(taskRoot, "Original_APKs"),
+        InputDirectory = input,
+        Engine = GameEngine.Godot
+    });
+
+    var result = await new AnalysisService().AnalyzeExistingDirectoryAsync(taskRoot);
+    Assert(result.Engine == GameEngine.Godot, "Godot version fixture engine");
+    Assert(result.EngineVersion?.RuntimeVersion == "4.6.1"
+           && result.EngineVersion.BuildFlavor == "stable.custom_build", "Godot exact native runtime version");
+    Assert(result.EngineVersion?.BytecodeVersion == "4.5.0"
+           && result.EngineVersion.Confidence == DetectionConfidence.Conflict, "Godot runtime and bytecode conflict retained");
+    Assert(result.ScriptRuntime?.Kind == "GDScript" && !result.ScriptRuntime.RequiresDotNet,
+        "Godot GDScript recommends standard editor");
+    Assert(result.RecoveryReadiness?.Status == RecoveryReadinessStatus.Ready,
+        "Godot recovery readiness");
+    Console.WriteLine("PASS Godot engine intelligence");
+}
+
+static async Task TestUnityVersionIntelligenceAsync(string root)
+{
+    var input = Path.Combine(root, "unity-version-intelligence", "Extracted");
+    var data = Path.Combine(input, "base", "assets", "bin", "Data");
+    var native = Path.Combine(input, "config.arm64_v8a", "lib", "arm64-v8a");
+    Directory.CreateDirectory(data);
+    Directory.CreateDirectory(native);
+    await File.WriteAllBytesAsync(Path.Combine(data, "globalgamemanagers"),
+        Encoding.ASCII.GetBytes("header\02022.3.15f1\0data"));
+    await File.WriteAllTextAsync(Path.Combine(native, "libil2cpp.so"), "il2cpp");
+    var result = await new AnalysisService().AnalyzeExistingDirectoryAsync(input);
+    Assert(result.Engine == GameEngine.Unity && result.EngineVersion?.ContentVersion == "2022.3.15f1",
+        "Unity serialized version detection");
+    Assert(result.ScriptRuntime?.Kind == "IL2CPP", "Unity IL2CPP runtime detection");
+    Assert(result.RecoveryReadiness?.Status == RecoveryReadinessStatus.Partial
+           && result.RecoveryReadiness.Missing.Contains("global-metadata.dat"),
+        "Unity incomplete IL2CPP pair warning");
+
+    var unity6 = Path.Combine(root, "unity6000-version", "Extracted");
+    Directory.CreateDirectory(unity6);
+    await File.WriteAllBytesAsync(Path.Combine(unity6, "data.unity3d"),
+        Encoding.ASCII.GetBytes("UnityFS\0format\06000.1.2f1\0revision"));
+    var unity6Result = await new AnalysisService().AnalyzeExistingDirectoryAsync(unity6);
+    Assert(unity6Result.EngineVersion?.ContentVersion == "6000.1.2f1", "Unity 6000 version detection");
+    Console.WriteLine("PASS Unity engine intelligence");
+}
+
+static async Task TestUnrealVersionIntelligenceAsync(string root)
+{
+    var input = Path.Combine(root, "unreal-version-intelligence", "Extracted");
+    Directory.CreateDirectory(input);
+    await File.WriteAllBytesAsync(Path.Combine(input, "libUnreal.so"),
+        Encoding.ASCII.GetBytes("prefix\0++UE5+Release-5.3\0suffix"));
+    await File.WriteAllTextAsync(Path.Combine(input, "pakchunk0.utoc"), "toc");
+    await File.WriteAllTextAsync(Path.Combine(input, "pakchunk0.ucas"), "cas");
+    var result = await new AnalysisService().AnalyzeExistingDirectoryAsync(input);
+    Assert(result.Engine == GameEngine.Unreal && result.EngineVersion?.RuntimeVersion == "5.3",
+        "Unreal native branch version detection");
+    Assert(result.EngineVersion?.ContentVersion == "UE5.x（IoStore）", "Unreal IoStore compatibility range");
+    Assert(result.RecoveryReadiness?.Status == RecoveryReadinessStatus.Ready, "Unreal paired IoStore readiness");
+
+    File.Delete(Path.Combine(input, "pakchunk0.ucas"));
+    var incomplete = await new AnalysisService().AnalyzeExistingDirectoryAsync(input);
+    Assert(incomplete.RecoveryReadiness?.Status == RecoveryReadinessStatus.Blocked
+           && incomplete.RecoveryReadiness.Missing.Any(item => item.EndsWith(".ucas", StringComparison.OrdinalIgnoreCase)),
+        "Unreal missing UCAS blocks recovery");
+    Console.WriteLine("PASS Unreal engine intelligence");
+}
+
+static async Task TestAnalysisJsonKeyFileLimitAsync(string root)
+{
+    var taskRoot = Path.Combine(root, "analysis-json-limit");
+    Directory.CreateDirectory(taskRoot);
+    var keyFiles = Enumerable.Range(0, 520).Select(index => $"assets/scene-{index:D4}.scn").ToArray();
+    var result = new AnalysisResult("com.example.limit", "fixture", taskRoot,
+        Path.Combine(taskRoot, "Original_APKs"), Path.Combine(taskRoot, "Extracted"),
+        Path.Combine(taskRoot, "分析说明.txt"), Path.Combine(taskRoot, "analysis.json"),
+        GameEngine.Godot, "GDScript", [], keyFiles, new Dictionary<string, int> { [".scn"] = 520 },
+        520, 520, KeyFileCount: 520, KeyFilesTruncated: true);
+    await AnalysisPipeline.WriteAnalysisArtifactsAsync(result, CancellationToken.None);
+    using var document = JsonDocument.Parse(await File.ReadAllTextAsync(result.JsonPath));
+    Assert(document.RootElement.GetProperty("KeyFiles").GetArrayLength() == 500,
+        "analysis JSON caps key file samples");
+    Assert(document.RootElement.GetProperty("KeyFileCount").GetInt32() == 520
+           && document.RootElement.GetProperty("KeyFilesTruncated").GetBoolean(),
+        "analysis JSON records full key file count");
+    Assert(File.ReadAllLines(Path.Combine(taskRoot, "KeyFiles", "全部关键文件.txt")).Length == 520,
+        "full key file index remains available");
+    Console.WriteLine("PASS analysis JSON key file limit");
+}
+
+static async Task TestRecentTaskIndexAsync(string root)
+{
+    var output = Path.Combine(root, "recent-output");
+    var index = Path.Combine(root, "recent-index.json");
+    var service = new RecentTaskService(index);
+    for (var i = 0; i < 35; i++)
+    {
+        var taskRoot = Path.Combine(output, $"com.example.task{i:D2}_20260716-120000");
+        Directory.CreateDirectory(Path.Combine(taskRoot, "Extracted"));
+        await TaskManifestStore.SaveAsync(new TaskManifest
+        {
+            JobRoot = taskRoot,
+            PackageName = $"com.example.task{i:D2}",
+            OriginalApksDirectory = Path.Combine(taskRoot, "Original_APKs"),
+            InputDirectory = Path.Combine(taskRoot, "Extracted"),
+            Engine = i % 2 == 0 ? GameEngine.Unity : GameEngine.Godot,
+            EngineVersion = i % 2 == 0 ? "2022.3.15f1" : "4.6.1 stable",
+            CurrentStage = WorkflowStage.Completed,
+            Status = WorkflowTaskStatus.Completed,
+            UpdatedAtUtc = DateTimeOffset.UtcNow.AddMinutes(i)
+        });
+        await service.TrackAsync(taskRoot);
+    }
+    var tasks = await service.LoadAsync();
+    Assert(tasks.Count == 30, "recent task index is capped at 30");
+    Assert(tasks[0].PackageName == "com.example.task34", "recent task index sorted by update time");
+    await service.RemoveAsync(tasks[0].JobRoot);
+    Assert((await service.LoadAsync()).All(item => item.PackageName != "com.example.task34"),
+        "recent task removal only updates index");
+
+    var legacy = Path.Combine(output, "com.example.legacy", "20260716-130000");
+    Directory.CreateDirectory(legacy);
+    await TaskManifestStore.SaveAsync(new TaskManifest
+    {
+        JobRoot = legacy,
+        PackageName = "com.example.legacy",
+        OriginalApksDirectory = Path.Combine(legacy, "Original_APKs"),
+        CurrentStage = WorkflowStage.Downloaded,
+        Status = WorkflowTaskStatus.Completed,
+        UpdatedAtUtc = DateTimeOffset.UtcNow.AddDays(2)
+    });
+    var refreshed = await service.RefreshFromOutputRootAsync(output);
+    Assert(refreshed.Any(item => item.PackageName == "com.example.legacy"),
+        "recent task refresh imports legacy two-level tasks");
+    Console.WriteLine("PASS recent task index");
+}
+
 static async Task TestV3TaskManifestCompatibilityAsync(string root)
 {
     var taskRoot = Path.Combine(root, "v3-manifest");
@@ -106,6 +266,9 @@ static async Task TestV3SettingsMigrationAsync(string root)
     Assert(settings.LastMode == (int)WorkflowMode.RecoverResources &&
            settings.AssetRipperPath?.EndsWith("AssetRipper.exe", StringComparison.OrdinalIgnoreCase) == true,
         "v3 settings migrate third stage and AssetRipper path");
+    Assert(settings.DownloadPaneHeight == 340 && settings.ExtractAnalyzePaneHeight == 310
+           && settings.RecoveryPaneHeight == 330,
+        "v3 settings receive resizable pane defaults");
     Console.WriteLine("PASS v3 settings migration");
 }
 
@@ -177,6 +340,8 @@ static async Task TestGodotRecoveryAsync(string root)
     var result = await service.RecoverAsync(new EngineRecoveryRequest(input, key));
     Assert(result.Engine == GameEngine.Godot && File.Exists(Path.Combine(result.OutputDirectory, "project.godot")),
         "GDRETools Godot recovery output");
+    Assert(result.Summary?.OutputFiles > 0 && result.Summary.ErrorCount == 0,
+        "Godot recovery quality summary");
     Assert(processes.Requests.Single().Arguments.Any(arg => arg.StartsWith("--recover=")), "GDRETools recover argument");
     Assert(!File.ReadAllText(Path.Combine(Directory.GetParent(result.OutputDirectory)!.FullName, "engine-recovery.json")).Contains(key),
         "Godot temporary key not persisted");
@@ -211,6 +376,8 @@ static async Task TestUnrealPakRecoveryAsync(string root)
     var result = await service.RecoverAsync(new EngineRecoveryRequest(input));
     Assert(result.Engine == GameEngine.Unreal && result.ProcessedContainers == 1 && launched == 1,
         "UE4 PAK recovery and FModel launch");
+    Assert(result.Summary?.ProcessedContainers == 1 && result.Summary.FailedContainers == 0,
+        "Unreal recovery quality summary");
     Assert(processes.Requests.Any(request => request.Arguments.Contains("info"))
            && processes.Requests.Any(request => request.Arguments.Contains("unpack")), "repak info and unpack commands");
     Console.WriteLine("PASS Unreal PAK recovery dispatcher");
@@ -353,6 +520,11 @@ static async Task TestGodotSampleAsync(string root)
     var result = await AnalysisPipeline.ExtractAndAnalyzeAsync("com.oakever.meowdoku", "Google Play fixture", job);
     Assert(result.Engine == GameEngine.Godot, "Godot engine detection");
     Assert(result.Splits.Count == 5, "Godot split count");
+    Assert(result.EngineVersion?.RuntimeVersion == "4.6.1"
+           && result.EngineVersion.BuildFlavor == "stable.custom_build", "Godot sample exact runtime version");
+    Assert(result.ScriptRuntime?.Kind.Contains("GDScript", StringComparison.Ordinal) == true
+           && !result.ScriptRuntime.RequiresDotNet,
+        "Godot sample recommends standard editor");
     Assert(Directory.EnumerateFiles(result.InputDirectory, "*.scn", SearchOption.AllDirectories).Any(), "Godot scenes extracted");
     Assert(File.ReadAllText(result.ReportPath).Contains("GDRETools"), "Godot recovery recommendation");
     Console.WriteLine("PASS real Godot split sample");
@@ -381,6 +553,11 @@ static async Task TestExternalApkCreatesNewTaskWithoutChangingSourceAsync(string
     Assert(!PathsEqual(first.JobRoot, second.JobRoot), "external APK repeated run creates new task");
     Assert(IsPathInside(destination, first.JobRoot) && IsPathInside(destination, second.JobRoot),
         "external APK tasks stay under destination root");
+    Assert(PathsEqual(Path.GetDirectoryName(first.JobRoot)!, destination)
+           && Path.GetFileName(first.JobRoot).StartsWith("com.example.external_", StringComparison.Ordinal),
+        "new task layout uses one flat package_timestamp directory");
+    Assert(PathsEqual(first.InputDirectory, Path.Combine(first.JobRoot, "Extracted")),
+        "new task extraction directory has engine-neutral name");
     Assert(first.Engine == GameEngine.Unity && second.Engine == GameEngine.Unity,
         "external APK tasks are analyzed");
     Assert(File.Exists(Path.Combine(first.JobRoot, "task.json"))
@@ -416,7 +593,7 @@ static async Task TestDownloadedTaskContinuesInPlaceAsync(string root)
     Assert(PathsEqual(result.JobRoot, jobRoot), "downloaded task continues in same job root");
     Assert(PathsEqual(result.OriginalApksDirectory, originalApks),
         "downloaded task reuses Original_APKs");
-    Assert(PathsEqual(result.InputDirectory, Path.Combine(jobRoot, "AssetRipper_Input")),
+    Assert(PathsEqual(result.InputDirectory, Path.Combine(jobRoot, "Extracted")),
         "downloaded task creates input beside originals");
     Assert(CaptureFileSnapshot(downloadedApk) == apkBefore, "downloaded APK remains unchanged");
     Assert(result.Engine == GameEngine.Unity && result.ScriptingBackend == "IL2CPP",

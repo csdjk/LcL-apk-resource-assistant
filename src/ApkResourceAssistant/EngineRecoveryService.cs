@@ -68,17 +68,28 @@ internal sealed class EngineRecoveryService : IDisposable
         {
             _launchGui(installation.ExecutablePath, installation.Directory);
             var reason = result.ExitCode != 0 ? $"退出码 {result.ExitCode}" : "恢复目录为空";
+            var version = await EngineIntelligenceAnalyzer.EnrichGodotRecoveryAsync(
+                analysis.EngineVersion ?? EngineVersionInfo.Unknown, output, log, cancellationToken);
+            var summary = await EngineIntelligenceAnalyzer.BuildRecoverySummaryAsync(
+                output, log, 0, 1, cancellationToken);
             var fallback = new EngineRecoveryResult(GameEngine.Godot, EngineRecoveryOutcome.ManualFallback,
                 input, output, installation.Spec.DisplayName, installation.Spec.Version,
                 $"GDRETools 自动恢复未完成（{reason}），已启动图形界面供手动检查输入和密钥。", log,
-                ToolLaunched: true);
+                FailedContainers: 1, ToolLaunched: true, EngineVersion: version, Summary: summary,
+                ScriptRuntime: analysis.ScriptRuntime, Readiness: analysis.RecoveryReadiness);
             await PersistRecoveryAsync(analysis, fallback, cancellationToken);
             progress?.Report(new WorkflowProgress(WorkflowStage.ReadyForEngineTool, fallback.Message, 100));
             return fallback;
         }
+        var recoveredVersion = await EngineIntelligenceAnalyzer.EnrichGodotRecoveryAsync(
+            analysis.EngineVersion ?? EngineVersionInfo.Unknown, output, log, cancellationToken);
+        var recoveredSummary = await EngineIntelligenceAnalyzer.BuildRecoverySummaryAsync(
+            output, log, 0, 0, cancellationToken);
         var recovery = new EngineRecoveryResult(GameEngine.Godot, EngineRecoveryOutcome.Completed,
             input, output, installation.Spec.DisplayName, installation.Spec.Version,
-            "Godot 工程恢复完成。建议使用 GDRETools 检测到的相同 Godot 版本打开。", log);
+            "Godot 工程恢复完成。请按运行时版本与字节码兼容提示选择编辑器。", log,
+            EngineVersion: recoveredVersion, Summary: recoveredSummary,
+            ScriptRuntime: analysis.ScriptRuntime, Readiness: analysis.RecoveryReadiness);
         await PersistRecoveryAsync(analysis, recovery, cancellationToken);
         progress?.Report(new WorkflowProgress(WorkflowStage.ReadyForEngineTool, recovery.Message, 100));
         return recovery;
@@ -174,6 +185,15 @@ internal sealed class EngineRecoveryService : IDisposable
             staged, output, $"{repak.Spec.DisplayName} + {(retoc == null ? "" : retoc.Spec.DisplayName + " + ")}FModel",
             $"{repak.Spec.Version}/{retoc?.Spec.Version ?? "-"}/{fmodel.Spec.Version}", message, logs,
             processed, failures, true);
+        var summary = await EngineIntelligenceAnalyzer.BuildRecoverySummaryAsync(
+            output, null, processed, failures, cancellationToken);
+        recovery = recovery with
+        {
+            EngineVersion = analysis.EngineVersion ?? EngineVersionInfo.Unknown,
+            Summary = summary,
+            ScriptRuntime = analysis.ScriptRuntime,
+            Readiness = analysis.RecoveryReadiness
+        };
         await PersistRecoveryAsync(analysis, recovery, cancellationToken);
         progress?.Report(new WorkflowProgress(WorkflowStage.ReadyForEngineTool, recovery.Message, 100));
         return recovery;
@@ -219,8 +239,10 @@ internal sealed class EngineRecoveryService : IDisposable
         if (manifest == null) return;
         await TaskManifestStore.SaveAsync(manifest with
         {
-            SchemaVersion = 2,
+            SchemaVersion = 3,
             Engine = recovery.Engine,
+            EngineVersion = recovery.EngineVersion?.DisplayVersion,
+            EngineVersionConfidence = recovery.EngineVersion?.Confidence,
             RecoveryDirectory = recovery.OutputDirectory,
             RecoveryTool = recovery.ToolName,
             CurrentStage = WorkflowStage.ReadyForEngineTool,

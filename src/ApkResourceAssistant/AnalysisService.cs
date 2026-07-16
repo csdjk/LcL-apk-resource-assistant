@@ -23,7 +23,7 @@ internal sealed class AnalysisService
             manifest = await TaskManifestStore.TransitionAsync(manifest, WorkflowStage.AnalyzingFiles,
                 inputDirectory: extraction.InputDirectory, cancellationToken: cancellationToken);
             progress?.Report(new WorkflowProgress(WorkflowStage.AnalyzingFiles, "识别游戏引擎和关键文件", 0));
-            var scan = await ScanCoreAsync(extraction.InputDirectory, progress, cancellationToken);
+            var scan = await ScanCoreAsync(extraction.InputDirectory, extraction.JobRoot, progress, cancellationToken);
             var reportPath = Path.Combine(extraction.JobRoot, "分析说明.txt");
             var jsonPath = Path.Combine(extraction.JobRoot, "analysis.json");
             var result = new AnalysisResult(
@@ -41,11 +41,24 @@ internal sealed class AnalysisService
                 scan.ExtensionCounts,
                 extraction.ExtractedBytes,
                 extraction.ExtractedFiles,
-                BuildEngineInventory(extraction.InputDirectory, scan.RelativeFiles, extraction.JobRoot));
+                BuildEngineInventory(extraction.InputDirectory, scan.RelativeFiles, extraction.JobRoot),
+                EngineDetection: scan.Intelligence.Detection,
+                EngineVersion: scan.Intelligence.Version,
+                ScriptRuntime: scan.Intelligence.ScriptRuntime,
+                RecoveryReadiness: scan.Intelligence.Readiness,
+                KeyFileCount: scan.KeyFiles.Count,
+                KeyFilesTruncated: scan.KeyFiles.Count > 500);
 
             progress?.Report(new WorkflowProgress(WorkflowStage.AnalyzingFiles, "生成分析报告", 90));
             await AnalysisPipeline.WriteAnalysisArtifactsAsync(result, cancellationToken);
-            manifest = manifest with { SchemaVersion = 2, Engine = result.Engine };
+            manifest = manifest with
+            {
+                SchemaVersion = 3,
+                Engine = result.Engine,
+                EngineVersion = result.EngineVersion?.DisplayVersion,
+                EngineVersionConfidence = result.EngineVersion?.Confidence,
+                RecoveryReadiness = result.RecoveryReadiness?.Status
+            };
             manifest = await TaskManifestStore.TransitionAsync(manifest, WorkflowStage.ReadyForAssetRipper,
                 completedStage: WorkflowStage.AnalyzingFiles, inputDirectory: extraction.InputDirectory,
                 cancellationToken: cancellationToken);
@@ -75,7 +88,7 @@ internal sealed class AnalysisService
     {
         var resolved = await ResolveInputDirectoryAsync(selectedPath, cancellationToken);
         progress?.Report(new WorkflowProgress(WorkflowStage.AnalyzingFiles, "只读扫描现有目录", 0));
-        var scan = await ScanCoreAsync(resolved.InputDirectory, progress, cancellationToken);
+        var scan = await ScanCoreAsync(resolved.InputDirectory, resolved.TaskRoot, progress, cancellationToken);
         progress?.Report(new WorkflowProgress(WorkflowStage.Completed,
             $"目录识别完成：{scan.Engine} / {scan.ScriptingBackend}", 100));
         return new DirectoryAnalysis(
@@ -93,7 +106,12 @@ internal sealed class AnalysisService
             scan.FileCount,
             resolved.IsExistingTask,
             AnalysisPipeline.BuildRecommendation(scan.Engine),
-            BuildEngineInventory(resolved.InputDirectory, scan.RelativeFiles, resolved.TaskRoot));
+            BuildEngineInventory(resolved.InputDirectory, scan.RelativeFiles, resolved.TaskRoot),
+            scan.Intelligence.Detection,
+            scan.Intelligence.Version,
+            scan.Intelligence.ScriptRuntime,
+            scan.Intelligence.Readiness,
+            scan.KeyFiles.Count);
     }
 
     public async Task<ResolvedAnalysisDirectory> ResolveInputDirectoryAsync(
@@ -160,6 +178,7 @@ internal sealed class AnalysisService
 
     private static async Task<ScanResult> ScanCoreAsync(
         string inputDirectory,
+        string? taskRoot,
         IProgress<WorkflowProgress>? progress,
         CancellationToken cancellationToken)
     {
@@ -179,11 +198,13 @@ internal sealed class AnalysisService
                 await Task.Yield();
             }
         }
-        var engine = AnalysisPipeline.DetectEngine(relativeFiles);
-        var backend = AnalysisPipeline.DetectScriptingBackend(relativeFiles);
+        var intelligence = await EngineIntelligenceAnalyzer.AnalyzeAsync(
+            inputDirectory, taskRoot, relativeFiles, progress, cancellationToken);
+        var engine = intelligence.Detection.Engine;
+        var backend = intelligence.ScriptRuntime.Kind;
         var keyFiles = AnalysisPipeline.FindKeyFiles(relativeFiles);
         var extensions = AnalysisPipeline.CountExtensions(relativeFiles);
-        return new ScanResult(engine, backend, keyFiles, extensions, totalBytes, count, relativeFiles);
+        return new ScanResult(engine, backend, keyFiles, extensions, totalBytes, count, relativeFiles, intelligence);
     }
 
     private static EngineAssetInventory BuildEngineInventory(string root, IReadOnlyList<string> relativeFiles, string? taskRoot)
@@ -250,7 +271,8 @@ internal sealed class AnalysisService
         IReadOnlyDictionary<string, int> ExtensionCounts,
         long TotalBytes,
         int FileCount,
-        IReadOnlyList<string> RelativeFiles);
+        IReadOnlyList<string> RelativeFiles,
+        EngineIntelligenceResult Intelligence);
 
     private readonly record struct Metadata(string? InputDirectory, string? PackageName, string? Source);
 }

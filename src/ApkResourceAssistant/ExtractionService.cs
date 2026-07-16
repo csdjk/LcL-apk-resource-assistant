@@ -112,6 +112,7 @@ internal sealed class ExtractionService
 
         var existingManifest = await TaskManifestStore.TryLoadAsync(jobRoot, cancellationToken);
         var hasPriorOutput = File.Exists(Path.Combine(jobRoot, "analysis.json"))
+            || DirectoryHasContent(Path.Combine(jobRoot, "Extracted"))
             || DirectoryHasContent(Path.Combine(jobRoot, "AssetRipper_Input"))
             || existingManifest?.CompletedStages.Contains(WorkflowStage.AnalyzingFiles) == true
             || existingManifest?.CurrentStage is WorkflowStage.ReadyForAssetRipper or WorkflowStage.Completed;
@@ -164,7 +165,7 @@ internal sealed class ExtractionService
         var manifest = prepared.Manifest;
         try
         {
-            var inputDir = Path.Combine(prepared.JobRoot, "AssetRipper_Input");
+            var inputDir = Path.Combine(prepared.JobRoot, "Extracted");
             var keyDir = Path.Combine(prepared.JobRoot, "KeyFiles");
             if (DirectoryHasContent(inputDir))
                 throw new InvalidOperationException("目标任务已经包含解压结果；为保护旧结果，请创建新的时间戳任务。");
@@ -267,14 +268,15 @@ internal sealed class ExtractionService
     {
         if (string.IsNullOrWhiteSpace(destinationRoot)) throw new ArgumentException("请选择任务保存目录。", nameof(destinationRoot));
         var root = Path.GetFullPath(destinationRoot);
-        var packageRoot = Path.Combine(root, AnalysisPipeline.SanitizeFileName(NormalizePackageName(packageName)));
+        var safePackage = AnalysisPipeline.SanitizeFileName(NormalizePackageName(packageName));
         lock (JobDirectoryLock)
         {
-            Directory.CreateDirectory(packageRoot);
+            Directory.CreateDirectory(root);
             var timestamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
-            var candidate = Path.Combine(packageRoot, timestamp);
+            var taskName = $"{safePackage}_{timestamp}";
+            var candidate = Path.Combine(root, taskName);
             var suffix = 2;
-            while (Directory.Exists(candidate)) candidate = Path.Combine(packageRoot, $"{timestamp}-{suffix++}");
+            while (Directory.Exists(candidate)) candidate = Path.Combine(root, $"{taskName}-{suffix++}");
             Directory.CreateDirectory(candidate);
             return candidate;
         }

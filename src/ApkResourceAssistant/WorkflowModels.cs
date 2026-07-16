@@ -46,7 +46,7 @@ internal sealed record WorkflowProgress(
 
 internal sealed record TaskManifest
 {
-    public int SchemaVersion { get; init; } = 2;
+    public int SchemaVersion { get; init; } = 3;
     public string TaskId { get; init; } = Guid.NewGuid().ToString("N");
     public string PackageName { get; init; } = "local-apk";
     public string Source { get; init; } = "本地 APK";
@@ -58,6 +58,9 @@ internal sealed record TaskManifest
     public string OriginalApksDirectory { get; init; } = "";
     public string? InputDirectory { get; init; }
     public GameEngine? Engine { get; init; }
+    public string? EngineVersion { get; init; }
+    public DetectionConfidence? EngineVersionConfidence { get; init; }
+    public RecoveryReadinessStatus? RecoveryReadiness { get; init; }
     public string? RecoveryDirectory { get; init; }
     public string? RecoveryTool { get; init; }
     public IReadOnlyList<string> SourceFiles { get; init; } = [];
@@ -103,7 +106,12 @@ internal sealed record DirectoryAnalysis(
     int FileCount,
     bool IsExistingTask,
     string Recommendation,
-    EngineAssetInventory? EngineAssets = null);
+    EngineAssetInventory? EngineAssets = null,
+    EngineDetectionInfo? EngineDetection = null,
+    EngineVersionInfo? EngineVersion = null,
+    ScriptRuntimeInfo? ScriptRuntime = null,
+    RecoveryReadiness? RecoveryReadiness = null,
+    int KeyFileCount = 0);
 
 internal sealed record EngineAssetInventory(
     IReadOnlyList<string> GodotPackages,
@@ -138,7 +146,12 @@ internal sealed record EngineRecoveryResult(
     string? LogPath,
     int ProcessedContainers = 0,
     int FailedContainers = 0,
-    bool ToolLaunched = false);
+    bool ToolLaunched = false,
+    int SchemaVersion = 2,
+    EngineVersionInfo? EngineVersion = null,
+    RecoverySummary? Summary = null,
+    ScriptRuntimeInfo? ScriptRuntime = null,
+    RecoveryReadiness? Readiness = null);
 
 internal sealed record ResolvedAnalysisDirectory(
     string SelectedPath,

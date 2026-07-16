@@ -29,7 +29,14 @@ internal sealed record AnalysisResult(
     IReadOnlyDictionary<string, int> ExtensionCounts,
     long ExtractedBytes,
     int ExtractedFiles,
-    EngineAssetInventory? EngineAssets = null);
+    EngineAssetInventory? EngineAssets = null,
+    int SchemaVersion = 2,
+    EngineDetectionInfo? EngineDetection = null,
+    EngineVersionInfo? EngineVersion = null,
+    ScriptRuntimeInfo? ScriptRuntime = null,
+    RecoveryReadiness? RecoveryReadiness = null,
+    int KeyFileCount = 0,
+    bool KeyFilesTruncated = false);
 
 /// <summary>
 /// Backwards-compatible facade retained for the v2 UI and existing integrations.
@@ -122,28 +129,68 @@ internal static class AnalysisPipeline
         return target;
     }
 
-    internal static GameEngine DetectEngine(IEnumerable<string> paths)
+    internal static GameEngine DetectEngine(IEnumerable<string> paths) => DetectEngineInfo(paths).Engine;
+
+    internal static EngineDetectionInfo DetectEngineInfo(IEnumerable<string> paths)
     {
         var unity = 0;
         var godot = 0;
         var unreal = 0;
+        var unityEvidence = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var godotEvidence = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var unrealEvidence = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var raw in paths)
         {
             var path = raw.Replace('\\', '/').ToLowerInvariant();
             var name = Path.GetFileName(path);
-            if (name is "globalgamemanagers" or "global-metadata.dat" or "libunity.so" or "libil2cpp.so") unity += 8;
-            if (path.Contains("assets/bin/data/") || path.EndsWith("data.unity3d") || path.EndsWith(".assets") || path.EndsWith(".bundle")) unity += 3;
-            if (path.Contains("/.godot/") || path.StartsWith(".godot/") || path.EndsWith(".pck") || name.Contains("godot")) godot += 8;
-            if (path.EndsWith(".scn") || path.EndsWith(".tscn") || path.EndsWith(".res") || path.EndsWith(".tres")) godot += 2;
+            if (name is "globalgamemanagers" or "global-metadata.dat" or "libunity.so" or "libil2cpp.so")
+            {
+                unity += 8;
+                if (unityEvidence.Count < 8) unityEvidence.Add(raw);
+            }
+            if (path.Contains("assets/bin/data/") || path.EndsWith("data.unity3d") || path.EndsWith(".assets") || path.EndsWith(".bundle"))
+            {
+                unity += 3;
+                if (unityEvidence.Count < 8) unityEvidence.Add(raw);
+            }
+            if (path.Contains("/.godot/") || path.StartsWith(".godot/") || path.EndsWith(".pck") || name.Contains("godot"))
+            {
+                godot += 8;
+                if (godotEvidence.Count < 8) godotEvidence.Add(raw);
+            }
+            if (path.EndsWith(".scn") || path.EndsWith(".tscn") || path.EndsWith(".res") || path.EndsWith(".tres"))
+            {
+                godot += 2;
+                if (godotEvidence.Count < 8) godotEvidence.Add(raw);
+            }
             if (path.EndsWith(".pak") || path.EndsWith(".utoc") || path.EndsWith(".ucas")
-                || name is "libue4.so" or "libunreal.so" || path.Contains("ue4game/") || path.Contains("unrealengine/")) unreal += 8;
-            if (path.EndsWith(".uasset") || path.EndsWith(".umap")) unreal += 3;
+                || name is "libue4.so" or "libunreal.so" || path.Contains("ue4game/") || path.Contains("unrealengine/"))
+            {
+                unreal += 8;
+                if (unrealEvidence.Count < 8) unrealEvidence.Add(raw);
+            }
+            if (path.EndsWith(".uasset") || path.EndsWith(".umap"))
+            {
+                unreal += 3;
+                if (unrealEvidence.Count < 8) unrealEvidence.Add(raw);
+            }
         }
         var best = Math.Max(unity, Math.Max(godot, unreal));
-        if (best < 3) return GameEngine.Unknown;
-        if (unity == best) return GameEngine.Unity;
-        if (godot == best) return GameEngine.Godot;
-        return GameEngine.Unreal;
+        if (best < 3) return EngineDetectionInfo.Unknown;
+        var scores = new[] { unity, godot, unreal }.OrderByDescending(value => value).ToArray();
+        var engine = unity == best ? GameEngine.Unity : godot == best ? GameEngine.Godot : GameEngine.Unreal;
+        var evidence = engine switch
+        {
+            GameEngine.Unity => unityEvidence.ToArray(),
+            GameEngine.Godot => godotEvidence.ToArray(),
+            _ => unrealEvidence.ToArray()
+        };
+        var confidence = scores[0] == scores[1]
+            ? DetectionConfidence.Conflict
+            : best >= 8 && scores[0] - scores[1] >= 5
+                ? DetectionConfidence.High
+                : DetectionConfidence.Approximate;
+        return new EngineDetectionInfo(engine, best, confidence, evidence);
     }
 
     internal static string DetectScriptingBackend(IEnumerable<string> paths)
@@ -185,7 +232,10 @@ internal static class AnalysisPipeline
         Directory.CreateDirectory(keyDir);
         await WriteKeyIndexesAsync(keyDir, result.KeyFiles, cancellationToken);
         await File.WriteAllTextAsync(result.ReportPath, BuildChineseReport(result), new UTF8Encoding(false), cancellationToken);
-        await File.WriteAllTextAsync(result.JsonPath, JsonSerializer.Serialize(result, JsonOptions), new UTF8Encoding(false), cancellationToken);
+        var jsonResult = result.KeyFiles.Count > 500
+            ? result with { KeyFiles = result.KeyFiles.Take(500).ToArray(), KeyFilesTruncated = true }
+            : result;
+        await File.WriteAllTextAsync(result.JsonPath, JsonSerializer.Serialize(jsonResult, JsonOptions), new UTF8Encoding(false), cancellationToken);
     }
 
     private static async Task WriteKeyIndexesAsync(string keyDir, IReadOnlyList<string> keyFiles, CancellationToken cancellationToken)
@@ -215,7 +265,13 @@ internal static class AnalysisPipeline
         builder.AppendLine($"包名：{result.PackageName}");
         builder.AppendLine($"下载源：{result.Source}");
         builder.AppendLine($"引擎：{result.Engine}");
-        builder.AppendLine($"脚本后端：{result.ScriptingBackend}");
+        builder.AppendLine($"引擎版本：{result.EngineVersion?.DisplayVersion ?? "未知"}");
+        builder.AppendLine($"版本可信度：{FormatConfidence(result.EngineVersion?.Confidence ?? DetectionConfidence.Unknown)}");
+        if (!string.IsNullOrWhiteSpace(result.EngineVersion?.RuntimeVersion)) builder.AppendLine($"运行时版本：{result.EngineVersion.RuntimeVersion}");
+        if (!string.IsNullOrWhiteSpace(result.EngineVersion?.ContentVersion)) builder.AppendLine($"资源版本：{result.EngineVersion.ContentVersion}");
+        if (!string.IsNullOrWhiteSpace(result.EngineVersion?.BytecodeVersion)) builder.AppendLine($"字节码版本：{result.EngineVersion.BytecodeVersion}");
+        builder.AppendLine($"脚本/运行时：{result.ScriptRuntime?.Kind ?? result.ScriptingBackend}");
+        builder.AppendLine($"恢复准备：{FormatReadiness(result.RecoveryReadiness?.Status ?? RecoveryReadinessStatus.Unknown)}");
         builder.AppendLine($"APK 数量：{result.Splits.Count}");
         builder.AppendLine($"解压文件：{result.ExtractedFiles}（{FormatBytes(result.ExtractedBytes)}）");
         if (result.EngineAssets != null)
@@ -226,6 +282,11 @@ internal static class AnalysisPipeline
         builder.AppendLine();
         builder.AppendLine("建议：");
         builder.AppendLine(recommendation);
+        if (result.ScriptRuntime != null) builder.AppendLine(result.ScriptRuntime.Recommendation);
+        if (result.EngineVersion?.Warnings.Count > 0)
+            foreach (var warning in result.EngineVersion.Warnings) builder.AppendLine($"- 版本提示：{warning}");
+        if (result.RecoveryReadiness?.Missing.Count > 0)
+            foreach (var missing in result.RecoveryReadiness.Missing) builder.AppendLine($"- 缺少：{missing}");
         builder.AppendLine("安装包内不一定包含游戏启动后下载的 Addressables、OBB 或热更新资源；必要时还需采集设备上的 Android/data/<包名>/files。 ");
         builder.AppendLine();
         builder.AppendLine("关键文件：");
@@ -236,7 +297,7 @@ internal static class AnalysisPipeline
 
     internal static string BuildRecommendation(GameEngine engine) => engine switch
     {
-        GameEngine.Unity => "已生成 AssetRipper_Input。将整个目录交给 AssetRipper，以便同时读取 Base、ABI split 和 Asset Pack。",
+        GameEngine.Unity => "已生成 Extracted。将整个目录交给 AssetRipper，以便同时读取 Base、ABI split 和 Asset Pack。",
         GameEngine.Godot => "检测到 Godot。可使用 GDRETools 从 APK、PCK 或解压目录恢复 Godot_Recovered 工程。",
         GameEngine.Unreal => "检测到 Unreal Engine。可使用 repak 处理 PAK、retoc 处理 UE5 IoStore（UTOC/UCAS），并用 FModel 浏览资源。",
         _ => "未识别明确引擎。请从扩展名统计和关键文件索引继续判断。"
@@ -283,4 +344,21 @@ internal static class AnalysisPipeline
         while (size >= 1024 && unit < units.Length - 1) { size /= 1024; unit++; }
         return $"{size:0.##} {units[unit]}";
     }
+
+    internal static string FormatConfidence(DetectionConfidence confidence) => confidence switch
+    {
+        DetectionConfidence.Exact => "精确",
+        DetectionConfidence.High => "高",
+        DetectionConfidence.Approximate => "估计",
+        DetectionConfidence.Conflict => "冲突",
+        _ => "未知"
+    };
+
+    internal static string FormatReadiness(RecoveryReadinessStatus status) => status switch
+    {
+        RecoveryReadinessStatus.Ready => "可恢复",
+        RecoveryReadinessStatus.Partial => "部分缺失",
+        RecoveryReadinessStatus.Blocked => "阻塞",
+        _ => "未知"
+    };
 }

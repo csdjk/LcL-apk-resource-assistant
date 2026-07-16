@@ -18,8 +18,20 @@ internal sealed class MainForm : Form
     private readonly WorkflowCoordinator _workflow = new();
     private readonly AssetRipperLauncher _assetRipperLauncher = new();
     private readonly EngineRecoveryService _engineRecoveryService = new();
+    private readonly RecentTaskService _recentTaskService = new();
 
     private readonly TableLayoutPanel _root = new();
+    private readonly SplitContainer _contentSplit = new()
+    {
+        Dock = DockStyle.Fill,
+        Orientation = Orientation.Horizontal,
+        SplitterWidth = 8,
+        SplitterIncrement = 8,
+        BackColor = UiTheme.Border,
+        Margin = new Padding(0),
+        TabStop = false,
+        AccessibleName = "工作区与结果区高度调整"
+    };
     private readonly Panel _workflowHost = new();
     private readonly ModeCard[] _modeCards =
     [
@@ -66,12 +78,20 @@ internal sealed class MainForm : Form
     private readonly Button _resultOpen = UiTheme.SecondaryButton("打开目录");
     private readonly Button _resultCopy = UiTheme.SecondaryButton("复制路径");
     private readonly Button _resultNext = UiTheme.PrimaryButton("继续下一步");
+    private readonly Button _resultCopyVersion = UiTheme.SecondaryButton("复制版本");
+    private readonly Button _resultVersionPage = UiTheme.SecondaryButton("版本下载页");
+    private readonly Button _resultEvidence = UiTheme.SecondaryButton("版本依据");
+    private readonly Label _metricEngine = CreateMetricLabel();
+    private readonly Label _metricVersion = CreateMetricLabel();
+    private readonly Label _metricRuntime = CreateMetricLabel();
+    private readonly Label _metricReadiness = CreateMetricLabel();
 
     private readonly Label _stage = UiTheme.Caption("当前阶段：下载 APK · 就绪");
     private readonly ProgressBar _progress = new() { Style = ProgressBarStyle.Blocks, Minimum = 0, Maximum = 100 };
     private readonly Button _cancel = UiTheme.SecondaryButton("取消");
     private readonly Button _logToggle = UiTheme.LinkButton("展开运行日志 ︾");
     private readonly Button _settingsButton = UiTheme.SecondaryButton("⚙  设置", 38);
+    private readonly Button _recentTasksButton = UiTheme.SecondaryButton("最近任务", 38);
     private readonly TextBox _log = new()
     {
         Multiline = true,
@@ -87,6 +107,7 @@ internal sealed class MainForm : Form
     private WorkflowMode _mode;
     private CancellationTokenSource? _operationCts;
     private bool _busy;
+    private bool _applyingSplitLayout;
     private bool _logExpanded;
     private Rectangle? _logCollapsedBounds;
     private bool _closeWhenIdle;
@@ -97,6 +118,10 @@ internal sealed class MainForm : Form
     private string? _openPath;
     private string? _copyPath;
     private NextAction _nextAction;
+    private EngineVersionInfo? _currentEngineVersion;
+    private GameEngine _currentPresentedEngine = GameEngine.Unknown;
+    private string _compactResultDetails = string.Empty;
+    private bool _versionEvidenceExpanded;
 
     public MainForm()
     {
@@ -121,7 +146,11 @@ internal sealed class MainForm : Form
         ShowModeHint();
         foreach (var message in _startupMessages) AppendLog(message);
 
-        Shown += (_, _) => AppendLog("APK Resource Assistant v4.0.0 已就绪。可从任意阶段开始。");
+        Shown += (_, _) =>
+        {
+            ApplySavedSplitterDistance();
+            AppendLog("APK Resource Assistant v5.0.0 已就绪。可从任意阶段开始。");
+        };
         FormClosing += MainFormClosing;
         FormClosed += (_, _) =>
         {
@@ -142,7 +171,7 @@ internal sealed class MainForm : Form
         _extractOutput.Text = output;
         _downloadSplits.Checked = _settings.Split;
         _extractSelection.Text = "尚未选择。支持 APK 文件、APK 文件夹、Original_APKs 或旧任务目录。";
-        _assetSelection.Text = "尚未选择。支持已有解压目录、旧任务目录或 AssetRipper_Input。";
+        _assetSelection.Text = "尚未选择。支持 Extracted、旧版 AssetRipper_Input 或任务目录。";
         _engineKey.UseSystemPasswordChar = true;
         _cancel.Enabled = false;
         _resultOpen.Enabled = false;
@@ -154,11 +183,10 @@ internal sealed class MainForm : Form
     {
         _root.Dock = DockStyle.Fill;
         _root.ColumnCount = 1;
-        _root.RowCount = 6;
+        _root.RowCount = 5;
         _root.BackColor = UiTheme.Window;
         _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
         _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 116));
-        _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 272));
         _root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 78));
         _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 0));
@@ -169,22 +197,28 @@ internal sealed class MainForm : Form
 
         _workflowHost.Dock = DockStyle.Fill;
         _workflowHost.BackColor = UiTheme.Window;
-        _workflowHost.Margin = new Padding(0, 8, 0, 8);
+        _workflowHost.Margin = new Padding(0);
         _workflowHost.Controls.Add(BuildDownloadPanel());
         _workflowHost.Controls.Add(BuildExtractPanel());
         _workflowHost.Controls.Add(BuildAssetPanel());
-        _root.Controls.Add(_workflowHost, 0, 2);
+        _contentSplit.Panel1.BackColor = UiTheme.Window;
+        _contentSplit.Panel1.Padding = new Padding(0, 8, 0, 4);
+        _contentSplit.Panel1.Controls.Add(_workflowHost);
+        _contentSplit.Panel2.BackColor = UiTheme.Window;
+        _contentSplit.Panel2.Padding = new Padding(0, 4, 0, 8);
+        _contentSplit.Panel2.Controls.Add(BuildResultCard());
+        _root.Controls.Add(_contentSplit, 0, 2);
 
-        _root.Controls.Add(BuildResultCard(), 0, 3);
-        _root.Controls.Add(BuildStatusBar(), 0, 4);
-        _root.Controls.Add(BuildLogCard(), 0, 5);
+        _root.Controls.Add(BuildStatusBar(), 0, 3);
+        _root.Controls.Add(BuildLogCard(), 0, 4);
     }
 
     private Control BuildHeader()
     {
-        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, BackColor = UiTheme.Window };
+        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, BackColor = UiTheme.Window };
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 108));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 104));
         var text = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -196,10 +230,14 @@ internal sealed class MainForm : Form
         text.Controls.Add(UiTheme.Heading("APK Resource Assistant", 17F));
         text.Controls.Add(UiTheme.Caption("下载、解压、分析各自独立；完成后由你决定是否进入下一步。"));
         panel.Controls.Add(text, 0, 0);
+        _recentTasksButton.Dock = DockStyle.Top;
+        _recentTasksButton.Margin = new Padding(0, 4, 8, 0);
+        _recentTasksButton.Click += async (_, _) => await ShowRecentTasksAsync();
+        panel.Controls.Add(_recentTasksButton, 1, 0);
         _settingsButton.Dock = DockStyle.Top;
         _settingsButton.Margin = new Padding(0, 4, 0, 0);
         _settingsButton.Click += (_, _) => ShowSettings();
-        panel.Controls.Add(_settingsButton, 1, 0);
+        panel.Controls.Add(_settingsButton, 2, 0);
         return panel;
     }
 
@@ -324,7 +362,7 @@ internal sealed class MainForm : Form
         table.SetColumnSpan(hint, 2);
         var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Margin = new Padding(0) };
         _assetRun.Width = 210;
-        _assetLaunchOnly.Width = 112;
+        _assetLaunchOnly.Width = 150;
         _assetLaunchOnly.Margin = new Padding(0, 0, 10, 0);
         actions.Controls.Add(_assetRun);
         actions.Controls.Add(_assetLaunchOnly);
@@ -364,7 +402,8 @@ internal sealed class MainForm : Form
     private Control BuildResultCard()
     {
         var card = new CardPanel { Dock = DockStyle.Fill, Margin = new Padding(0, 2, 0, 8), Padding = new Padding(18, 14, 18, 12) };
-        var table = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Margin = new Padding(0) };
+        var table = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Margin = new Padding(0) };
+        table.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         table.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         table.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         table.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
@@ -376,20 +415,33 @@ internal sealed class MainForm : Form
         header.Controls.Add(_resultTitle);
         header.Controls.Add(_resultBadge);
         table.Controls.Add(header, 0, 0);
+        var metrics = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, Margin = new Padding(0, 2, 0, 2) };
+        for (var i = 0; i < 4; i++) metrics.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+        metrics.Controls.Add(_metricEngine, 0, 0);
+        metrics.Controls.Add(_metricVersion, 1, 0);
+        metrics.Controls.Add(_metricRuntime, 2, 0);
+        metrics.Controls.Add(_metricReadiness, 3, 0);
+        table.Controls.Add(metrics, 0, 1);
         _resultDetails.Dock = DockStyle.Fill;
         _resultDetails.Margin = new Padding(0, 3, 0, 4);
-        table.Controls.Add(_resultDetails, 0, 1);
+        table.Controls.Add(_resultDetails, 0, 2);
 
         var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Margin = new Padding(0) };
-        _resultNext.Width = 190;
-        _resultOpen.Width = 100;
-        _resultCopy.Width = 100;
-        _resultOpen.Margin = new Padding(8, 0, 0, 0);
-        _resultCopy.Margin = new Padding(8, 0, 0, 0);
+        _resultNext.Width = 168;
+        _resultOpen.Width = 92;
+        _resultCopy.Width = 92;
+        _resultCopyVersion.Width = 92;
+        _resultVersionPage.Width = 104;
+        _resultEvidence.Width = 92;
+        foreach (var button in new[] { _resultOpen, _resultCopy, _resultCopyVersion, _resultVersionPage, _resultEvidence })
+            button.Margin = new Padding(8, 0, 0, 0);
         actions.Controls.Add(_resultNext);
         actions.Controls.Add(_resultCopy);
         actions.Controls.Add(_resultOpen);
-        table.Controls.Add(actions, 0, 2);
+        actions.Controls.Add(_resultVersionPage);
+        actions.Controls.Add(_resultCopyVersion);
+        actions.Controls.Add(_resultEvidence);
+        table.Controls.Add(actions, 0, 3);
         return card;
     }
 
@@ -456,6 +508,7 @@ internal sealed class MainForm : Form
             SetStage("正在取消当前阶段…", null);
         };
         _logToggle.Click += (_, _) => ToggleLog();
+        _contentSplit.SplitterMoved += (_, _) => SaveCurrentSplitterDistance();
         _resultOpen.Click += (_, _) =>
         {
             if (_openPath != null && !TryOpenPath(_openPath))
@@ -463,6 +516,9 @@ internal sealed class MainForm : Form
         };
         _resultCopy.Click += (_, _) => CopyCurrentPath();
         _resultNext.Click += (_, _) => ContinueToNextStage();
+        _resultCopyVersion.Click += (_, _) => CopyCurrentVersion();
+        _resultVersionPage.Click += (_, _) => OpenEngineVersionPage();
+        _resultEvidence.Click += (_, _) => ToggleVersionEvidence();
         DragEnter += MainDragEnter;
         DragDrop += MainDragDrop;
     }
@@ -480,7 +536,62 @@ internal sealed class MainForm : Form
             TrySaveSettings();
             ShowModeHint();
         }
+        _root.PerformLayout();
+        ApplySavedSplitterDistance();
         SetStage($"当前阶段：{ModeTitle(mode)} · 就绪", 0, false);
+    }
+
+    private void ApplySavedSplitterDistance()
+    {
+        if (_contentSplit.Height <= _contentSplit.SplitterWidth + 160) return;
+        var available = _contentSplit.Height - _contentSplit.SplitterWidth;
+        var resultMinimum = Math.Min(112, Math.Max(72, available / 3));
+        var requestedMinimum = _mode switch
+        {
+            WorkflowMode.Download => 288,
+            WorkflowMode.ExtractAnalyze => 264,
+            _ => 304
+        };
+        var workflowMinimum = Math.Min(requestedMinimum, Math.Max(180, available - resultMinimum));
+        var preferred = _mode switch
+        {
+            WorkflowMode.Download => _settings.DownloadPaneHeight,
+            WorkflowMode.ExtractAnalyze => _settings.ExtractAnalyzePaneHeight,
+            _ => _settings.RecoveryPaneHeight
+        };
+        var maximum = Math.Max(workflowMinimum, available - resultMinimum);
+
+        _applyingSplitLayout = true;
+        try
+        {
+            _contentSplit.Panel1MinSize = 0;
+            _contentSplit.Panel2MinSize = 0;
+            _contentSplit.SplitterDistance = Math.Clamp(preferred, workflowMinimum, maximum);
+            _contentSplit.Panel1MinSize = workflowMinimum;
+            _contentSplit.Panel2MinSize = resultMinimum;
+        }
+        finally
+        {
+            _applyingSplitLayout = false;
+        }
+    }
+
+    private void SaveCurrentSplitterDistance()
+    {
+        if (_applyingSplitLayout || _contentSplit.SplitterDistance <= 0) return;
+        switch (_mode)
+        {
+            case WorkflowMode.Download:
+                _settings.DownloadPaneHeight = _contentSplit.SplitterDistance;
+                break;
+            case WorkflowMode.ExtractAnalyze:
+                _settings.ExtractAnalyzePaneHeight = _contentSplit.SplitterDistance;
+                break;
+            default:
+                _settings.RecoveryPaneHeight = _contentSplit.SplitterDistance;
+                break;
+        }
+        TrySaveSettings();
     }
 
     private void ShowModeHint()
@@ -519,6 +630,7 @@ internal sealed class MainForm : Form
             SetStage("正在准备下载引擎和任务目录…", null);
             var result = await _downloadService.DownloadAsync(request, cancellationToken);
             _downloadResult = result;
+            await _recentTaskService.TrackAsync(result.JobDirectory, cancellationToken);
             _reuseDownloadedTask = true;
             _extractPaths.Clear();
             _extractSelection.Text = $"下载任务：{result.JobDirectory}";
@@ -569,6 +681,7 @@ internal sealed class MainForm : Form
                     cancellationToken);
             }
             _reuseDownloadedTask = false;
+            await _recentTaskService.TrackAsync(result.JobRoot, cancellationToken);
             ShowAnalysisResult(result);
         });
     }
@@ -580,11 +693,13 @@ internal sealed class MainForm : Form
         _assetSelection.Text = result.InputDirectory;
         var recommendation = AnalysisPipeline.BuildRecommendation(result.Engine);
         var details = new StringBuilder();
-        details.AppendLine($"引擎：{EngineName(result.Engine)}    脚本后端：{result.ScriptingBackend}    APK：{result.Splits.Count} 个");
-        details.AppendLine($"解压：{result.ExtractedFiles:N0} 个文件 / {AnalysisPipeline.FormatBytes(result.ExtractedBytes)}    关键文件：{result.KeyFiles.Count} 个");
+        details.AppendLine($"APK：{result.Splits.Count} 个    解压：{result.ExtractedFiles:N0} 个文件 / {AnalysisPipeline.FormatBytes(result.ExtractedBytes)}");
+        details.AppendLine($"关键文件：{result.KeyFileCount:N0} 个    推荐编辑器：{result.EngineVersion?.RecommendedEditorVersion ?? "待确认"}");
         details.AppendLine($"分析目录：{result.InputDirectory}");
         details.Append(recommendation);
+        AppendReadiness(details, result.RecoveryReadiness);
         SetResult("解压与分析完成", EngineName(result.Engine), Color.FromArgb(236, 253, 245), UiTheme.Success, details.ToString());
+        PresentEngineIntelligence(result.Engine, result.EngineVersion, result.ScriptRuntime, result.RecoveryReadiness, details.ToString());
         var canContinue = true;
         ConfigureResultActions(result.JobRoot, result.InputDirectory,
             canContinue ? NextAction.OpenWithEngineTool : NextAction.None,
@@ -618,6 +733,8 @@ internal sealed class MainForm : Form
                     var recovery = await _engineRecoveryService.RecoverAsync(
                         new EngineRecoveryRequest(analysis.InputDirectory, _engineKey.Text, _unrealExtract.Checked),
                         workflowProgress, cancellationToken);
+                    if (analysis.TaskRoot != null)
+                        await _recentTaskService.TrackAsync(analysis.TaskRoot, cancellationToken);
                     ShowEngineRecoveryResult(recovery);
                 }
                 finally { _engineKey.Clear(); }
@@ -661,15 +778,18 @@ internal sealed class MainForm : Form
     private void ShowDirectoryAnalysis(DirectoryAnalysis analysis, bool needsConfiguration)
     {
         var details = new StringBuilder();
-        details.AppendLine($"引擎：{EngineName(analysis.Engine)}    脚本后端：{analysis.ScriptingBackend}");
-        details.AppendLine($"文件：{analysis.FileCount:N0} 个 / {AnalysisPipeline.FormatBytes(analysis.TotalBytes)}    关键文件：{analysis.KeyFiles.Count} 个");
+        details.AppendLine($"文件：{analysis.FileCount:N0} 个 / {AnalysisPipeline.FormatBytes(analysis.TotalBytes)}    关键文件：{analysis.KeyFileCount:N0} 个");
+        details.AppendLine($"推荐编辑器：{analysis.EngineVersion?.RecommendedEditorVersion ?? "待确认"}");
         details.AppendLine($"输入目录：{analysis.InputDirectory}");
         details.AppendLine(analysis.Recommendation);
+        AppendReadiness(details, analysis.RecoveryReadiness);
         if (needsConfiguration) details.Append("请先在右上角“设置”中选择 AssetRipper.exe，再次执行本阶段。");
         SetResult("目录识别完成", EngineName(analysis.Engine),
             analysis.Engine is GameEngine.Godot or GameEngine.Unreal ? Color.FromArgb(255, 247, 237) : UiTheme.PrimarySoft,
             analysis.Engine is GameEngine.Godot or GameEngine.Unreal ? UiTheme.Warning : UiTheme.Primary,
             details.ToString().TrimEnd());
+        PresentEngineIntelligence(analysis.Engine, analysis.EngineVersion, analysis.ScriptRuntime,
+            analysis.RecoveryReadiness, details.ToString().TrimEnd());
         ConfigureResultActions(analysis.TaskRoot ?? analysis.InputDirectory, analysis.InputDirectory, NextAction.None, string.Empty);
         SetStage($"目录识别完成：{EngineName(analysis.Engine)}。", 100);
     }
@@ -677,7 +797,7 @@ internal sealed class MainForm : Form
     private void ShowAssetRipperResult(DirectoryAnalysis analysis, AssetRipperLaunchResult launch)
     {
         var details = new StringBuilder();
-        details.AppendLine($"引擎：{EngineName(analysis.Engine)}    脚本后端：{analysis.ScriptingBackend}");
+        details.AppendLine($"Unity 版本：{analysis.EngineVersion?.DisplayVersion ?? "未知"}    脚本：{analysis.ScriptRuntime?.Kind ?? analysis.ScriptingBackend}");
         details.AppendLine($"输入目录：{analysis.InputDirectory}");
         details.AppendLine(launch.Message);
         if (!string.IsNullOrWhiteSpace(launch.AutomaticLoadError)) details.AppendLine($"自动载入详情：{launch.AutomaticLoadError}");
@@ -686,6 +806,8 @@ internal sealed class MainForm : Form
             launch.AutoLoaded ? Color.FromArgb(236, 253, 245) : Color.FromArgb(255, 247, 237),
             launch.AutoLoaded ? UiTheme.Success : UiTheme.Warning,
             details.ToString().TrimEnd());
+        PresentEngineIntelligence(analysis.Engine, analysis.EngineVersion, analysis.ScriptRuntime,
+            analysis.RecoveryReadiness, details.ToString().TrimEnd());
         ConfigureResultActions(analysis.TaskRoot ?? analysis.InputDirectory, analysis.InputDirectory, NextAction.None, string.Empty);
         SetStage(launch.Message, 100);
     }
@@ -693,15 +815,19 @@ internal sealed class MainForm : Form
     private void ShowEngineRecoveryResult(EngineRecoveryResult recovery)
     {
         var details = new StringBuilder();
-        details.AppendLine($"引擎：{EngineName(recovery.Engine)}    工具：{recovery.ToolName} {recovery.ToolVersion}");
+        details.AppendLine($"恢复工具：{recovery.ToolName} {recovery.ToolVersion}");
+        details.AppendLine($"引擎版本：{recovery.EngineVersion?.DisplayVersion ?? "未知"}");
         details.AppendLine($"输入：{recovery.InputDirectory}");
         details.AppendLine($"输出：{recovery.OutputDirectory}");
         if (recovery.ProcessedContainers > 0)
             details.AppendLine($"容器：{recovery.ProcessedContainers} 个    失败：{recovery.FailedContainers} 个");
+        if (recovery.Summary != null)
+            details.AppendLine($"恢复输出：{recovery.Summary.OutputFiles:N0} 个文件 / {AnalysisPipeline.FormatBytes(recovery.Summary.OutputBytes)}    错误：{recovery.Summary.ErrorCount}");
         details.Append(recovery.Message);
         SetResult("引擎恢复阶段完成", EngineName(recovery.Engine),
             recovery.FailedContainers == 0 ? Color.FromArgb(236, 253, 245) : Color.FromArgb(255, 247, 237),
             recovery.FailedContainers == 0 ? UiTheme.Success : UiTheme.Warning, details.ToString());
+        PresentEngineIntelligence(recovery.Engine, recovery.EngineVersion, recovery.ScriptRuntime, recovery.Readiness, details.ToString());
         ConfigureResultActions(recovery.OutputDirectory, recovery.InputDirectory, NextAction.None, string.Empty);
         if (recovery.Engine == GameEngine.Unreal) TryCopyPath(recovery.InputDirectory);
         SetStage(recovery.Message, 100);
@@ -728,6 +854,10 @@ internal sealed class MainForm : Form
     {
         _resultOpen.Enabled = !_busy && !string.IsNullOrWhiteSpace(_openPath) && Directory.Exists(_openPath);
         _resultCopy.Enabled = !_busy && !string.IsNullOrWhiteSpace(_copyPath);
+        var hasVersion = _currentEngineVersion != null && _currentEngineVersion.DisplayVersion != "未知";
+        _resultCopyVersion.Enabled = !_busy && hasVersion;
+        _resultVersionPage.Enabled = !_busy && _currentPresentedEngine != GameEngine.Unknown;
+        _resultEvidence.Enabled = !_busy && _currentEngineVersion?.Evidence.Count > 0;
         SetNextEnabled(!_busy && _nextAction != NextAction.None);
     }
 
@@ -784,7 +914,7 @@ internal sealed class MainForm : Form
 
     private void SelectAssetDirectory()
     {
-        using var dialog = new FolderBrowserDialog { Description = "选择现有解压目录、旧任务目录或 AssetRipper_Input", UseDescriptionForTitle = true };
+        using var dialog = new FolderBrowserDialog { Description = "选择 Extracted、旧版 AssetRipper_Input 或任务目录", UseDescriptionForTitle = true };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         _assetPath = Path.GetFullPath(dialog.SelectedPath);
         _assetSelection.Text = _assetPath;
@@ -881,6 +1011,68 @@ internal sealed class MainForm : Form
             UpdateSettingsSummary();
             AppendLog("设置已保存。");
         }
+    }
+
+    private async Task ShowRecentTasksAsync()
+    {
+        if (_busy) return;
+        using var form = new RecentTasksForm(_recentTaskService, _settings.OutputDir ?? _downloadOutput.Text);
+        if (form.ShowDialog(this) == DialogResult.OK && form.SelectedTask != null)
+            await ContinueRecentTaskAsync(form.SelectedTask);
+    }
+
+    private async Task ContinueRecentTaskAsync(RecentTaskEntry task)
+    {
+        if (!Directory.Exists(task.JobRoot))
+        {
+            SetStage("最近任务目录已经不存在，请刷新任务列表。", 0);
+            return;
+        }
+        if (!string.IsNullOrWhiteSpace(task.RecoveryDirectory) && Directory.Exists(task.RecoveryDirectory))
+        {
+            TryOpenPath(task.RecoveryDirectory);
+            _assetPath = task.InputDirectory ?? task.JobRoot;
+            _assetSelection.Text = _assetPath;
+            SelectMode(WorkflowMode.RecoverResources);
+            SetStage("已打开最近任务的恢复目录。", 100);
+            return;
+        }
+        if (!string.IsNullOrWhiteSpace(task.InputDirectory) && Directory.Exists(task.InputDirectory)
+            && task.Engine != GameEngine.Unknown)
+        {
+            _assetPath = task.InputDirectory;
+            _assetSelection.Text = task.InputDirectory;
+            _assetEngine = task.Engine;
+            SelectMode(WorkflowMode.RecoverResources);
+            SetStage($"已载入最近任务：{task.PackageName}，可继续引擎恢复。", 0);
+            return;
+        }
+
+        var manifest = await TaskManifestStore.TryLoadAsync(task.JobRoot);
+        var originals = task.OriginalApksDirectory ?? Path.Combine(task.JobRoot, "Original_APKs");
+        if (manifest != null && Directory.Exists(originals))
+        {
+            var apkFiles = Directory.EnumerateFiles(originals, "*.apk", SearchOption.TopDirectoryOnly).ToArray();
+            var source = ParseDownloadSource(task.Source);
+            _downloadResult = new DownloadResult(task.PackageName, source, task.JobRoot, originals, apkFiles,
+                TaskManifestStore.GetPath(task.JobRoot), manifest.CreatedAtUtc, manifest);
+            _reuseDownloadedTask = true;
+            _extractPaths.Clear();
+            _extractSelection.Text = $"最近下载任务：{task.JobRoot}";
+            SelectMode(WorkflowMode.ExtractAnalyze);
+            SetStage($"已载入最近下载任务：{task.PackageName}，可继续解压。", 0);
+            return;
+        }
+
+        SetExternalExtractPaths([task.JobRoot]);
+        SetStage("已载入最近任务目录，请重新开始解压与分析。", 0);
+    }
+
+    private static DownloadSource ParseDownloadSource(string? source)
+    {
+        if (source?.Contains("个人", StringComparison.OrdinalIgnoreCase) == true) return DownloadSource.GooglePlayPersonal;
+        if (source?.Contains("匿名", StringComparison.OrdinalIgnoreCase) == true) return DownloadSource.GooglePlayAnonymous;
+        return DownloadSource.ApkPure;
     }
 
     private bool EnsureAssetRipperConfigured()
@@ -994,6 +1186,7 @@ internal sealed class MainForm : Form
         _busy = busy;
         foreach (var card in _modeCards) card.Enabled = !busy;
         _settingsButton.Enabled = !busy;
+        _recentTasksButton.Enabled = !busy;
         _downloadPackage.Enabled = !busy;
         _downloadSource.Enabled = !busy;
         _downloadOutput.Enabled = !busy;
@@ -1067,8 +1260,113 @@ internal sealed class MainForm : Form
         _resultBadge.Text = badge;
         _resultBadge.BackColor = badgeBackground;
         _resultBadge.ForeColor = badgeForeground;
+        _compactResultDetails = details;
+        _currentEngineVersion = null;
+        _currentPresentedEngine = GameEngine.Unknown;
+        _versionEvidenceExpanded = false;
+        _resultEvidence.Text = "版本依据";
+        SetMetric(_metricEngine, "引擎", "—");
+        SetMetric(_metricVersion, "版本", "—");
+        SetMetric(_metricRuntime, "脚本/运行时", "—");
+        SetMetric(_metricReadiness, "恢复准备", "—");
         _resultDetails.Text = details;
+        ApplyResultActionState();
     }
+
+    private void PresentEngineIntelligence(GameEngine engine, EngineVersionInfo? version,
+        ScriptRuntimeInfo? runtime, RecoveryReadiness? readiness, string compactDetails)
+    {
+        _currentPresentedEngine = engine;
+        _currentEngineVersion = version;
+        _compactResultDetails = compactDetails;
+        _versionEvidenceExpanded = false;
+        _resultEvidence.Text = "版本依据";
+        SetMetric(_metricEngine, "引擎", EngineName(engine));
+        var versionLabel = version == null
+            ? "未知"
+            : $"{version.DisplayVersion} · {AnalysisPipeline.FormatConfidence(version.Confidence)}";
+        SetMetric(_metricVersion, "版本", versionLabel);
+        SetMetric(_metricRuntime, "脚本/运行时", runtime?.Kind ?? "未知");
+        SetMetric(_metricReadiness, "恢复准备", AnalysisPipeline.FormatReadiness(
+            readiness?.Status ?? RecoveryReadinessStatus.Unknown));
+        RenderResultDetails();
+        ApplyResultActionState();
+    }
+
+    private void ToggleVersionEvidence()
+    {
+        if (_currentEngineVersion?.Evidence.Count is not > 0) return;
+        _versionEvidenceExpanded = !_versionEvidenceExpanded;
+        _resultEvidence.Text = _versionEvidenceExpanded ? "收起依据" : "版本依据";
+        RenderResultDetails();
+    }
+
+    private void RenderResultDetails()
+    {
+        if (!_versionEvidenceExpanded || _currentEngineVersion == null)
+        {
+            _resultDetails.Text = _compactResultDetails;
+            return;
+        }
+        var builder = new StringBuilder(_compactResultDetails.TrimEnd());
+        builder.AppendLine().AppendLine().AppendLine("版本依据：");
+        foreach (var evidence in _currentEngineVersion.Evidence)
+            builder.AppendLine($"• [{EvidenceRoleName(evidence.Role)} / {AnalysisPipeline.FormatConfidence(evidence.Confidence)}] {evidence.Value} — {evidence.Source}");
+        foreach (var warning in _currentEngineVersion.Warnings)
+            builder.AppendLine($"⚠ {warning}");
+        _resultDetails.Text = builder.ToString().TrimEnd();
+    }
+
+    private void CopyCurrentVersion()
+    {
+        var version = _currentEngineVersion?.RecommendedEditorVersion ?? _currentEngineVersion?.DisplayVersion;
+        if (string.IsNullOrWhiteSpace(version) || version == "未知") return;
+        SetStage(TryCopyPath(version) ? $"版本 {version} 已复制。" : "剪贴板暂时不可用。", 100);
+    }
+
+    private void OpenEngineVersionPage()
+    {
+        var url = _currentPresentedEngine switch
+        {
+            GameEngine.Godot => "https://godotengine.org/download/archive/",
+            GameEngine.Unity => "https://unity.com/releases/editor/archive",
+            GameEngine.Unreal => "https://www.unrealengine.com/download",
+            _ => null
+        };
+        if (url == null) return;
+        try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
+        catch (Exception ex) { SetStage("打开版本下载页失败：" + ex.Message, 100); }
+    }
+
+    private static string EvidenceRoleName(VersionEvidenceRole role) => role switch
+    {
+        VersionEvidenceRole.Runtime => "运行时",
+        VersionEvidenceRole.Content => "资源",
+        VersionEvidenceRole.Bytecode => "字节码",
+        VersionEvidenceRole.Container => "容器",
+        _ => "恢复工程"
+    };
+
+    private static void AppendReadiness(StringBuilder builder, RecoveryReadiness? readiness)
+    {
+        if (readiness == null) return;
+        builder.AppendLine().Append($"恢复准备：{readiness.Summary}");
+        foreach (var missing in readiness.Missing) builder.AppendLine().Append($"缺少：{missing}");
+        foreach (var warning in readiness.Warnings) builder.AppendLine().Append($"提示：{warning}");
+    }
+
+    private static Label CreateMetricLabel() => new()
+    {
+        Dock = DockStyle.Fill,
+        AutoEllipsis = true,
+        TextAlign = ContentAlignment.MiddleLeft,
+        BackColor = Color.FromArgb(248, 250, 252),
+        ForeColor = UiTheme.Text,
+        Padding = new Padding(8, 0, 6, 0),
+        Margin = new Padding(0, 0, 8, 0)
+    };
+
+    private static void SetMetric(Label label, string name, string value) => label.Text = $"{name}：{value}";
 
     private void ToggleLog()
     {
@@ -1085,8 +1383,8 @@ internal sealed class MainForm : Form
                 Bounds = new Rectangle(Left, expandedTop, Width, desiredHeight);
             }
         }
-        _root.RowStyles[5].SizeType = SizeType.Absolute;
-        _root.RowStyles[5].Height = _logExpanded ? 118 : 0;
+        _root.RowStyles[4].SizeType = SizeType.Absolute;
+        _root.RowStyles[4].Height = _logExpanded ? 118 : 0;
         _logToggle.Text = _logExpanded ? "收起运行日志 ︽" : "展开运行日志 ︾";
         if (!_logExpanded && _logCollapsedBounds.HasValue && WindowState == FormWindowState.Normal)
         {
