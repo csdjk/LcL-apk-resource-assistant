@@ -37,7 +37,7 @@ internal sealed class MainForm : Form
     [
         new(0, "下载 APK", "从 APKPure 或 Google Play 获取 APK / Split APK"),
         new(1, "解压与分析", "选择本地 APK、文件夹或以前的下载任务"),
-        new(2, "引擎恢复", "Unity / Godot / Unreal 自动选择专用工具")
+        new(2, "逆向与恢复", "自动识别引擎，提取资源或恢复工程")
     ];
 
     private readonly ComboBox _downloadSource = new() { DropDownStyle = ComboBoxStyle.DropDownList };
@@ -59,7 +59,7 @@ internal sealed class MainForm : Form
     private readonly Label _assetConfiguration = UiTheme.Caption(string.Empty);
     private readonly Button _assetSelectDirectory = UiTheme.SecondaryButton("选择目录…");
     private readonly Button _assetLaunchOnly = UiTheme.SecondaryButton("仅启动 AssetRipper");
-    private readonly Button _assetRun = UiTheme.PrimaryButton("识别并开始恢复");
+    private readonly Button _assetRun = UiTheme.PrimaryButton("开始逆向恢复");
     private readonly TextBox _engineKey = UiTheme.TextInput();
     private readonly CheckBox _unrealExtract = new() { Text = "UE：检查并解包 PAK / IoStore（推荐）", AutoSize = true, Checked = true };
 
@@ -336,7 +336,7 @@ internal sealed class MainForm : Form
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 126));
         card.Controls.Add(table);
-        AddPanelHeader(table, "引擎恢复", "Unity 使用 AssetRipper；Godot 使用 GDRETools；Unreal 使用 repak、retoc 与 FModel。", 3);
+        AddPanelHeader(table, "游戏工程逆向与恢复", "自动识别 Unity / Godot / Unreal，并选择对应工具提取资源或恢复工程。", 3);
         AddField(table, 1, "解压目录", _assetSelection, 1);
         _assetSelectDirectory.Dock = DockStyle.Fill;
         _assetSelectDirectory.Margin = new Padding(8, 3, 0, 3);
@@ -606,7 +606,7 @@ internal sealed class MainForm : Form
         {
             WorkflowMode.Download => ("等待下载", "填写商店链接或包名，选择下载源与保存目录。下载结束只生成 Original_APKs。"),
             WorkflowMode.ExtractAnalyze => ("等待解压与分析", "选择本地 APK、APK 文件夹或以前的下载任务。外部源文件保持原样。"),
-            _ => ("等待选择目录", "选择已有解压目录或旧任务目录，识别后自动选择 Unity、Godot 或 Unreal 恢复工具。")
+            _ => ("等待选择目录", "选择已有解压目录或旧任务目录，程序会识别引擎并选择对应的逆向恢复工具。")
         };
         SetResult(title, "就绪", UiTheme.PrimarySoft, UiTheme.Primary, details);
     }
@@ -708,7 +708,7 @@ internal sealed class MainForm : Form
                 GameEngine.Unity => "继续用 AssetRipper 打开",
                 GameEngine.Godot => "继续恢复 Godot 工程",
                 GameEngine.Unreal => "继续处理 Unreal 资源",
-                _ => "继续识别恢复工具"
+                _ => "继续逆向与恢复"
             });
         SetStage($"分析完成：{EngineName(result.Engine)} / {result.ScriptingBackend}。", 100);
     }
@@ -824,7 +824,7 @@ internal sealed class MainForm : Form
         if (recovery.Summary != null)
             details.AppendLine($"恢复输出：{recovery.Summary.OutputFiles:N0} 个文件 / {AnalysisPipeline.FormatBytes(recovery.Summary.OutputBytes)}    错误：{recovery.Summary.ErrorCount}");
         details.Append(recovery.Message);
-        SetResult("引擎恢复阶段完成", EngineName(recovery.Engine),
+        SetResult("逆向恢复完成", EngineName(recovery.Engine),
             recovery.FailedContainers == 0 ? Color.FromArgb(236, 253, 245) : Color.FromArgb(255, 247, 237),
             recovery.FailedContainers == 0 ? UiTheme.Success : UiTheme.Warning, details.ToString());
         PresentEngineIntelligence(recovery.Engine, recovery.EngineVersion, recovery.ScriptRuntime, recovery.Readiness, details.ToString());
@@ -1044,7 +1044,7 @@ internal sealed class MainForm : Form
             _assetSelection.Text = task.InputDirectory;
             _assetEngine = task.Engine;
             SelectMode(WorkflowMode.RecoverResources);
-            SetStage($"已载入最近任务：{task.PackageName}，可继续引擎恢复。", 0);
+            SetStage($"已载入最近任务：{task.PackageName}，可继续逆向与恢复。", 0);
             return;
         }
 
@@ -1467,7 +1467,7 @@ internal sealed class MainForm : Form
     {
         WorkflowMode.Download => "下载 APK",
         WorkflowMode.ExtractAnalyze => "解压与分析",
-        _ => "引擎恢复"
+        _ => "逆向与恢复"
     };
 
     private static string EngineName(GameEngine engine) => engine switch

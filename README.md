@@ -24,7 +24,7 @@
 - 区分运行时版本、资源兼容版本、GDScript 字节码版本、推荐编辑器版本和恢复工具版本
 - 检查 Unity IL2CPP 文件配对、Godot 恢复输入以及 Unreal UTOC/UCAS 配对
 
-### 3. 引擎恢复
+### 3. 逆向与恢复
 
 - 可选择已有解压目录、以前的任务根目录或 `Extracted`；旧版 `AssetRipper_Input` 仍兼容
 - 已有目录只做快速、只读扫描，不复制、不改写
